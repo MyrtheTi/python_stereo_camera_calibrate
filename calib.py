@@ -10,14 +10,15 @@ TODO:
 - Implement automatic checkerboard detection parameter tuning
 - Add validation metrics for calibration quality
 - Add option for stereocamera that uses the same camera stream
-- Add progress indicators during calibration processes
 - Implement structured error handling instead of using quit()
-- Add option to save/load calibration state for interrupted sessions
 """
 
 import glob
 import os
+import pickle
 import sys
+import time
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
@@ -27,6 +28,102 @@ from scipy import linalg
 
 # Dictionary to store calibration settings from YAML configuration file
 calibration_settings: Dict[str, Any] = {}
+
+
+@dataclass
+class CalibrationState:
+    """Class to track and store calibration state between sessions."""
+
+    # Step flags
+    frames_collected_cam0: bool = False
+    frames_collected_cam1: bool = False
+    intrinsics_calibrated_cam0: bool = False
+    intrinsics_calibrated_cam1: bool = False
+    stereo_frames_collected: bool = False
+    stereo_calibrated: bool = False
+
+    # Camera parameters
+    camera_matrix0: Optional[np.ndarray] = None
+    dist_coeffs0: Optional[np.ndarray] = None
+    camera_matrix1: Optional[np.ndarray] = None
+    dist_coeffs1: Optional[np.ndarray] = None
+
+    # Stereo calibration results
+    rotation_matrix: Optional[np.ndarray] = None
+    translation_vector: Optional[np.ndarray] = None
+
+    # Record when last modified
+    last_update: str = field(default_factory=lambda: time.strftime("%Y-%m-%d %H:%M:%S"))
+
+    def update_timestamp(self):
+        """Update the last modified timestamp."""
+        self.last_update = time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def save_calibration_state(
+    state: CalibrationState, directory: str = "camera_parameters"
+) -> None:
+    """
+    Save calibration state to a file for later resumption.
+
+    Parameters:
+        state: Current calibration state
+        directory: Directory to save the state file
+    """
+    if not os.path.exists(directory):
+        os.mkdir(directory)
+
+    state.update_timestamp()
+
+    filepath = os.path.join(directory, "calibration_state.pkl")
+    with open(filepath, "wb") as f:
+        pickle.dump(state, f)
+
+    print(f"Calibration state saved to {filepath}")
+
+
+def load_calibration_state(
+    directory: str = "camera_parameters",
+) -> Optional[CalibrationState]:
+    """
+    Load calibration state from a file if it exists.
+
+    Parameters:
+        directory: Directory where state file is located
+
+    Returns:
+        CalibrationState object if file exists, None otherwise
+    """
+    filepath = os.path.join(directory, "calibration_state.pkl")
+
+    if not os.path.exists(filepath):
+        return None
+
+    try:
+        with open(filepath, "rb") as f:
+            state = pickle.load(f)
+        print(
+            f"Loaded calibration state from {filepath} (last updated: {state.last_update})"
+        )
+        return state
+    except (pickle.UnpicklingError, EOFError):
+        print(
+            f"Error: Could not load calibration state from {filepath}. Starting fresh."
+        )
+        return None
+
+
+def print_step_banner(step_number: int, step_description: str) -> None:
+    """
+    Print a banner to indicate the current calibration step.
+
+    Parameters:
+        step_number: Current step number
+        step_description: Description of the current step
+    """
+    print("\n" + "=" * 80)
+    print(f"STEP {step_number}: {step_description}")
+    print("=" * 80 + "\n")
 
 
 def triangulate_point(
@@ -109,6 +206,8 @@ def save_frames_single_camera(camera_name: str) -> None:
     Returns:
         None. Frames are saved to the 'frames' directory with naming pattern {camera_name}_{frame_number}.png
     """
+    print(f"Starting frame collection for {camera_name}...")
+
     # Create frames directory if it doesn't exist
     if not os.path.exists("frames"):
         os.mkdir("frames")
@@ -127,6 +226,13 @@ def save_frames_single_camera(camera_name: str) -> None:
     cap.set(3, width)
     cap.set(4, height)
 
+    # Check if camera opened successfully
+    if not cap.isOpened():
+        print(
+            f"Error: Could not open camera {camera_name} (device ID: {camera_device_id})"
+        )
+        return
+
     cooldown = cooldown_time
     start = False
     saved_count = 0
@@ -135,7 +241,8 @@ def save_frames_single_camera(camera_name: str) -> None:
         ret, frame = cap.read()
         if not ret:
             print("No video data received from camera. Exiting...")
-            quit()
+            cap.release()
+            return
 
         # Create a smaller version of the frame for display
         frame_small = cv2.resize(frame, None, fx=1 / view_resize, fy=1 / view_resize)
@@ -164,7 +271,7 @@ def save_frames_single_camera(camera_name: str) -> None:
             )
             cv2.putText(
                 frame_small,
-                f"Num frames: {saved_count}",
+                f"Num frames: {saved_count}/{number_to_save}",
                 (50, 100),
                 cv2.FONT_HERSHEY_COMPLEX,
                 1,
@@ -177,21 +284,28 @@ def save_frames_single_camera(camera_name: str) -> None:
                 save_path = os.path.join("frames", f"{camera_name}_{saved_count}.png")
                 cv2.imwrite(save_path, frame)
                 saved_count += 1
+                print(
+                    f"Saved frame {saved_count}/{number_to_save} for {camera_name}",
+                    end="\r",
+                )
                 cooldown = cooldown_time
 
         cv2.imshow("frame_small", frame_small)
         key = cv2.waitKey(1)
 
         if key == 27:  # ESC key
-            quit()
+            print("Frame collection cancelled.")
+            break
 
         if key == 32:  # SPACE key
             start = True
 
         # Break out of the loop when enough frames have been saved
         if saved_count == number_to_save:
+            print(f"Completed collecting {number_to_save} frames for {camera_name}")
             break
 
+    cap.release()
     cv2.destroyAllWindows()
 
 
@@ -212,11 +326,19 @@ def calibrate_camera_for_intrinsic_parameters(
             - camera_matrix (numpy.ndarray): 3x3 camera intrinsic matrix
             - distortion_coeffs (numpy.ndarray): Camera distortion coefficients
     """
+    print(f"Calibrating {images_prefix.split('/')[-1]} intrinsics...")
     # Find all images matching the prefix pattern
-    image_paths = glob.glob(images_prefix)
+    image_paths = sorted(glob.glob(images_prefix))
+
+    if not image_paths:
+        print(f"Error: No images found matching {images_prefix}")
+        return None, None
+
+    print(f"Found {len(image_paths)} calibration images")
 
     # Read all calibration frames
     images = [cv2.imread(image_path, 1) for image_path in image_paths]
+    total_frames = len(images)
 
     # Criteria used by checkerboard pattern detector
     # (type, max_iterations, epsilon)
@@ -241,7 +363,8 @@ def calibrate_camera_for_intrinsic_parameters(
     # Corresponding 3D coordinates in world space
     object_points = []  # 3D points in real world space
 
-    for frame in images:
+    for i, frame in enumerate(images):
+        print(f"Processing frame {i+1}/{total_frames}", end="\r")
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         # Find the checkerboard corners
@@ -249,39 +372,71 @@ def calibrate_camera_for_intrinsic_parameters(
             gray, (rows, columns), None
         )
 
+        # Draw frame number and progress
+        display_frame = frame.copy()
+        cv2.putText(
+            display_frame,
+            f"Frame {i+1}/{total_frames}",
+            (25, 25),
+            cv2.FONT_HERSHEY_COMPLEX,
+            0.7,
+            (0, 0, 255),
+            1,
+        )
+
         if found_checkerboard:
             # Refine corner detection
             corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
             cv2.drawChessboardCorners(
-                frame, (rows, columns), corners, found_checkerboard
+                display_frame, (rows, columns), corners, found_checkerboard
             )
             cv2.putText(
-                frame,
-                'If detected points are poor, press "s" to skip this sample',
-                (25, 25),
+                display_frame,
+                'Press "s" to skip, any other key to use this image',
+                (25, 50),
                 cv2.FONT_HERSHEY_COMPLEX,
-                1,
+                0.7,
                 (0, 0, 255),
                 1,
             )
 
-            cv2.imshow("img", frame)
+            cv2.imshow("Calibration Image", display_frame)
             k = cv2.waitKey(0)
 
             if k & 0xFF == ord("s"):
-                print("skipping")
+                print(f"\nSkipping frame {i+1}")
                 continue
 
             object_points.append(checkerboard_points_3d)
             image_points.append(corners)
+        else:
+            print(f"No checkerboard found in frame {i+1}")
+            cv2.putText(
+                display_frame,
+                "No checkerboard detected! Press any key to continue.",
+                (25, 50),
+                cv2.FONT_HERSHEY_COMPLEX,
+                0.7,
+                (0, 0, 255),
+                1,
+            )
+            cv2.imshow("Calibration Image", display_frame)
+            cv2.waitKey(0)
 
     cv2.destroyAllWindows()
+    print("\nPerforming camera calibration...")
+
+    if not object_points:
+        print("Error: No valid calibration frames detected")
+        return None, None
+
     ret, camera_matrix, distortion_coeffs, rvecs, tvecs = cv2.calibrateCamera(
         object_points, image_points, (width, height), None, None
     )
-    print("rmse:", ret)
-    print("camera matrix:\n", camera_matrix)
-    print("distortion coeffs:", distortion_coeffs)
+    print("Camera calibration complete")
+    print("RMSE:", ret)
+    print("Camera matrix:\n", camera_matrix)
+    print("Distortion coeffs:", distortion_coeffs)
 
     return camera_matrix, distortion_coeffs
 
@@ -329,6 +484,10 @@ def save_frames_two_cams(camera0_name: str, camera1_name: str) -> None:
     Returns:
         None. Frame pairs are saved to the 'frames_pair' directory
     """
+    print(
+        f"Starting synchronized frame collection for {camera0_name} and {camera1_name}..."
+    )
+
     # Create frames directory for pairs if it doesn't exist
     if not os.path.exists("frames_pair"):
         os.mkdir("frames_pair")
@@ -341,6 +500,15 @@ def save_frames_two_cams(camera0_name: str, camera1_name: str) -> None:
     # Open video streams for both cameras
     cap0 = cv2.VideoCapture(calibration_settings[camera0_name])
     cap1 = cv2.VideoCapture(calibration_settings[camera1_name])
+
+    # Check if cameras opened successfully
+    if not cap0.isOpened() or not cap1.isOpened():
+        print("Error: Could not open one or both cameras")
+        if cap0.isOpened():
+            cap0.release()
+        if cap1.isOpened():
+            cap1.release()
+        return
 
     # Set camera resolutions
     width = calibration_settings["frame_width"]
@@ -360,7 +528,7 @@ def save_frames_two_cams(camera0_name: str, camera1_name: str) -> None:
 
         if not ret0 or not ret1:
             print("Cameras not returning video data. Exiting...")
-            quit()
+            break
 
         # Create smaller versions of frames for display
         frame0_small = cv2.resize(
@@ -405,7 +573,7 @@ def save_frames_two_cams(camera0_name: str, camera1_name: str) -> None:
                 )
                 cv2.putText(
                     frame,
-                    f"Num frames: {saved_count}",
+                    f"Num frames: {saved_count}/{number_to_save}",
                     (50, 100),
                     cv2.FONT_HERSHEY_COMPLEX,
                     1,
@@ -424,22 +592,28 @@ def save_frames_two_cams(camera0_name: str, camera1_name: str) -> None:
                     frame1,
                 )
                 saved_count += 1
+                print(f"Saved stereo frame pair {saved_count}/{number_to_save}")
                 cooldown = cooldown_time
 
-        cv2.imshow("frame0_small", frame0_small)
-        cv2.imshow("frame1_small", frame1_small)
+        cv2.imshow("Camera 0", frame0_small)
+        cv2.imshow("Camera 1", frame1_small)
         key = cv2.waitKey(1)
 
         if key == 27:  # ESC key
-            quit()
+            print("Frame collection cancelled.")
+            break
 
         if key == 32:  # SPACE key
             start = True
+            print("Stereo frame collection started...")
 
         # Break out of the loop when enough frames have been saved
         if saved_count == number_to_save:
+            print(f"Completed collecting {number_to_save} stereo frame pairs")
             break
 
+    cap0.release()
+    cap1.release()
     cv2.destroyAllWindows()
 
 
@@ -468,13 +642,30 @@ def stereo_calibrate(
     Returns:
         Tuple[np.ndarray, np.ndarray]: Rotation matrix and translation vector from camera0 to camera1
     """
+    print("Performing stereo calibration...")
     # Read the synchronized frame pairs
     c0_images_paths = sorted(glob.glob(frames_prefix_c0))
     c1_images_paths = sorted(glob.glob(frames_prefix_c1))
 
+    if not c0_images_paths or not c1_images_paths:
+        print("Error: No stereo image pairs found")
+        return None, None
+
+    if len(c0_images_paths) != len(c1_images_paths):
+        print(
+            f"Warning: Number of frames doesn't match between cameras: {len(c0_images_paths)} vs {len(c1_images_paths)}"
+        )
+
+    total_pairs = min(len(c0_images_paths), len(c1_images_paths))
+    print(f"Found {total_pairs} stereo image pairs")
+
     # Load all image pairs
-    c0_images = [cv2.imread(image_path, 1) for image_path in c0_images_paths]
-    c1_images = [cv2.imread(image_path, 1) for image_path in c1_images_paths]
+    c0_images = [
+        cv2.imread(image_path, 1) for image_path in c0_images_paths[:total_pairs]
+    ]
+    c1_images = [
+        cv2.imread(image_path, 1) for image_path in c1_images_paths[:total_pairs]
+    ]
 
     # Criteria for subpixel refinement
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.001)
@@ -499,13 +690,18 @@ def stereo_calibrate(
     object_points = []  # Corresponding 3D points in checkerboard space
 
     # Process each pair of frames
-    for frame0, frame1 in zip(c0_images, c1_images):
+    used_pairs = 0
+    for i, (frame0, frame1) in enumerate(zip(c0_images, c1_images)):
+        print(f"Processing stereo pair {i+1}/{total_pairs}", end="\r")
         gray0 = cv2.cvtColor(frame0, cv2.COLOR_BGR2GRAY)
         gray1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
 
         # Find checkerboard corners in both images
         ret0, corners0 = cv2.findChessboardCorners(gray0, (rows, columns), None)
         ret1, corners1 = cv2.findChessboardCorners(gray1, (rows, columns), None)
+
+        display_frame0 = frame0.copy()
+        display_frame1 = frame1.copy()
 
         # If checkerboard is found in both images
         if ret0 and ret1:
@@ -519,8 +715,8 @@ def stereo_calibrate(
 
             # Draw checkerboard corners and mark origin on both frames
             for frame, corners, ret, origin_point in [
-                (frame0, corners0, ret0, p0_c0),
-                (frame1, corners1, ret1, p0_c1),
+                (display_frame0, corners0, ret0, p0_c0),
+                (display_frame1, corners1, ret1, p0_c1),
             ]:
                 cv2.putText(
                     frame,
@@ -533,20 +729,74 @@ def stereo_calibrate(
                 )
                 cv2.drawChessboardCorners(frame, (rows, columns), corners, ret)
 
+                # Add progress indicator to frames
+                cv2.putText(
+                    frame,
+                    f"Pair {i+1}/{total_pairs} - Used: {used_pairs}",
+                    (25, 25),
+                    cv2.FONT_HERSHEY_COMPLEX,
+                    0.7,
+                    (0, 255, 0),
+                    1,
+                )
+                cv2.putText(
+                    frame,
+                    'Press "s" to skip, any other key to use this pair',
+                    (25, 50),
+                    cv2.FONT_HERSHEY_COMPLEX,
+                    0.7,
+                    (0, 255, 0),
+                    1,
+                )
+
             # Display frames with detected corners
-            cv2.imshow("Camera 0", frame0)
-            cv2.imshow("Camera 1", frame1)
+            cv2.imshow("Camera 0", display_frame0)
+            cv2.imshow("Camera 1", display_frame1)
             key = cv2.waitKey(0)
 
             # Skip this pair if 's' is pressed
             if key & 0xFF == ord("s"):
-                print("Skipping this image pair")
+                print(f"\nSkipping stereo pair {i+1}")
                 continue
 
             # Store points for calibration
             object_points.append(checkerboard_points_3d)
             image_points_left.append(corners0)
             image_points_right.append(corners1)
+            used_pairs += 1
+        else:
+            # Show message when checkerboard not found
+            if not ret0:
+                cv2.putText(
+                    display_frame0,
+                    "No checkerboard detected!",
+                    (25, 50),
+                    cv2.FONT_HERSHEY_COMPLEX,
+                    0.7,
+                    (0, 0, 255),
+                    1,
+                )
+            if not ret1:
+                cv2.putText(
+                    display_frame1,
+                    "No checkerboard detected!",
+                    (25, 50),
+                    cv2.FONT_HERSHEY_COMPLEX,
+                    0.7,
+                    (0, 0, 255),
+                    1,
+                )
+
+            cv2.imshow("Camera 0", display_frame0)
+            cv2.imshow("Camera 1", display_frame1)
+            cv2.waitKey(500)  # Show briefly and continue
+
+    cv2.destroyAllWindows()
+    print(f"Using {used_pairs}/{total_pairs} stereo pairs for calibration")
+
+    if used_pairs == 0:
+        print("Error: No valid stereo pairs found. Cannot perform calibration.")
+        return None, None
 
     # Perform stereo calibration, keeping intrinsics fixed
     stereocalibration_flags = cv2.CALIB_FIX_INTRINSIC
@@ -573,8 +823,8 @@ def stereo_calibrate(
         flags=stereocalibration_flags,
     )
 
+    print("Stereo calibration complete")
     print("Stereo calibration RMSE:", ret)
-    cv2.destroyAllWindows()
     return rotation_matrix, translation_vector
 
 
@@ -643,6 +893,7 @@ def check_calibration(
     Returns:
         None. Displays live video feeds with overlaid 3D axes
     """
+    print("Verifying calibration results...")
     # Extract camera parameters from the data lists
     cmtx0 = np.array(camera0_data[0])
     dist0 = np.array(camera0_data[1])
@@ -734,6 +985,8 @@ def check_calibration(
         if key == 27:  # ESC key
             break
 
+    cap0.release()
+    cap1.release()
     cv2.destroyAllWindows()
 
 
@@ -889,6 +1142,7 @@ def save_extrinsic_calibration_parameters(
     Returns:
         Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]: The input parameters (R0, T0, R1, T1)
     """
+    print("Saving extrinsic calibration parameters...")
     # Create output directory if it doesn't exist
     if not os.path.exists("camera_parameters"):
         os.mkdir("camera_parameters")
@@ -934,6 +1188,26 @@ def save_extrinsic_calibration_parameters(
     return R0, T0, R1, T1
 
 
+def ask_yes_no_question(question: str) -> bool:
+    """
+    Ask a yes/no question to the user.
+
+    Parameters:
+        question: Question to ask
+
+    Returns:
+        bool: True if yes, False if no
+    """
+    while True:
+        response = input(f"{question} (y/n): ").lower().strip()
+        if response in ["y", "yes"]:
+            return True
+        elif response in ["n", "no"]:
+            return False
+        else:
+            print("Please answer with 'y' or 'n'")
+
+
 if __name__ == "__main__":
     if len(sys.argv) != 2:
         print(
@@ -944,32 +1218,174 @@ if __name__ == "__main__":
     # Open and parse the settings file
     parse_calibration_settings_file(sys.argv[1])
 
+    # Try to load existing calibration state
+    calibration_state = load_calibration_state()
+
+    # Initialize state if none exists
+    if calibration_state is None:
+        calibration_state = CalibrationState()
+        print("Starting new calibration process")
+    else:
+        print("\nResuming from previous calibration session:")
+        print(
+            f"- Camera 0 frames collected: {'Yes' if calibration_state.frames_collected_cam0 else 'No'}"
+        )
+        print(
+            f"- Camera 1 frames collected: {'Yes' if calibration_state.frames_collected_cam1 else 'No'}"
+        )
+        print(
+            f"- Camera 0 intrinsics calibrated: {'Yes' if calibration_state.intrinsics_calibrated_cam0 else 'No'}"
+        )
+        print(
+            f"- Camera 1 intrinsics calibrated: {'Yes' if calibration_state.intrinsics_calibrated_cam1 else 'No'}"
+        )
+        print(
+            f"- Stereo frames collected: {'Yes' if calibration_state.stereo_frames_collected else 'No'}"
+        )
+        print(
+            f"- Stereo calibrated: {'Yes' if calibration_state.stereo_calibrated else 'No'}"
+        )
+
     """Step1. Save calibration frames for single cameras"""
-    save_frames_single_camera("camera0")  # save frames for camera0
-    save_frames_single_camera("camera1")  # save frames for camera1
+    print_step_banner(1, "SAVE CALIBRATION FRAMES FOR SINGLE CAMERAS")
+
+    # Camera 0
+    if not calibration_state.frames_collected_cam0:
+        save_frames_single_camera("camera0")
+        calibration_state.frames_collected_cam0 = True
+        save_calibration_state(calibration_state)
+    else:
+        print("Camera 0 frames already collected. Skipping.")
+
+        # Option to recollect if needed
+        if ask_yes_no_question("Do you want to recollect frames for camera0?"):
+            save_frames_single_camera("camera0")
+            calibration_state.frames_collected_cam0 = True
+            save_calibration_state(calibration_state)
+
+    # Camera 1
+    if not calibration_state.frames_collected_cam1:
+        save_frames_single_camera("camera1")
+        calibration_state.frames_collected_cam1 = True
+        save_calibration_state(calibration_state)
+    else:
+        print("Camera 1 frames already collected. Skipping.")
+
+        # Option to recollect if needed
+        if ask_yes_no_question("Do you want to recollect frames for camera1?"):
+            save_frames_single_camera("camera1")
+            calibration_state.frames_collected_cam1 = True
+            save_calibration_state(calibration_state)
 
     """Step2. Obtain camera intrinsic matrices and save them"""
-    # camera0 intrinsics
-    images_prefix = os.path.join("frames", "camera0*")
-    cmtx0, dist0 = calibrate_camera_for_intrinsic_parameters(images_prefix)
-    save_camera_intrinsics(cmtx0, dist0, "camera0")
+    print_step_banner(2, "CALIBRATE CAMERA INTRINSICS")
 
-    # camera1 intrinsics
-    images_prefix = os.path.join("frames", "camera1*")
-    cmtx1, dist1 = calibrate_camera_for_intrinsic_parameters(images_prefix)
-    save_camera_intrinsics(cmtx1, dist1, "camera1")
+    # Camera 0 intrinsics
+    if not calibration_state.intrinsics_calibrated_cam0:
+        images_prefix = os.path.join("frames", "camera0*")
+        cmtx0, dist0 = calibrate_camera_for_intrinsic_parameters(images_prefix)
+
+        if cmtx0 is not None and dist0 is not None:
+            save_camera_intrinsics(cmtx0, dist0, "camera0")
+            calibration_state.camera_matrix0 = cmtx0
+            calibration_state.dist_coeffs0 = dist0
+            calibration_state.intrinsics_calibrated_cam0 = True
+            save_calibration_state(calibration_state)
+    else:
+        print("Camera 0 intrinsics already calibrated. Loading parameters...")
+        cmtx0 = calibration_state.camera_matrix0
+        dist0 = calibration_state.dist_coeffs0
+
+        # Option to recalibrate if needed
+        if ask_yes_no_question("Do you want to recalibrate camera0 intrinsics?"):
+            images_prefix = os.path.join("frames", "camera0*")
+            cmtx0, dist0 = calibrate_camera_for_intrinsic_parameters(images_prefix)
+
+            if cmtx0 is not None and dist0 is not None:
+                save_camera_intrinsics(cmtx0, dist0, "camera0")
+                calibration_state.camera_matrix0 = cmtx0
+                calibration_state.dist_coeffs0 = dist0
+                save_calibration_state(calibration_state)
+
+    # Camera 1 intrinsics
+    if not calibration_state.intrinsics_calibrated_cam1:
+        images_prefix = os.path.join("frames", "camera1*")
+        cmtx1, dist1 = calibrate_camera_for_intrinsic_parameters(images_prefix)
+
+        if cmtx1 is not None and dist1 is not None:
+            save_camera_intrinsics(cmtx1, dist1, "camera1")
+            calibration_state.camera_matrix1 = cmtx1
+            calibration_state.dist_coeffs1 = dist1
+            calibration_state.intrinsics_calibrated_cam1 = True
+            save_calibration_state(calibration_state)
+    else:
+        print("Camera 1 intrinsics already calibrated. Loading parameters...")
+        cmtx1 = calibration_state.camera_matrix1
+        dist1 = calibration_state.dist_coeffs1
+
+        # Option to recalibrate if needed
+        if ask_yes_no_question("Do you want to recalibrate camera1 intrinsics?"):
+            images_prefix = os.path.join("frames", "camera1*")
+            cmtx1, dist1 = calibrate_camera_for_intrinsic_parameters(images_prefix)
+
+            if cmtx1 is not None and dist1 is not None:
+                save_camera_intrinsics(cmtx1, dist1, "camera1")
+                calibration_state.camera_matrix1 = cmtx1
+                calibration_state.dist_coeffs1 = dist1
+                save_calibration_state(calibration_state)
 
     """Step3. Save calibration frames for both cameras simultaneously"""
-    save_frames_two_cams("camera0", "camera1")
+    print_step_banner(3, "COLLECT SYNCHRONIZED STEREO FRAMES")
+
+    if not calibration_state.stereo_frames_collected:
+        save_frames_two_cams("camera0", "camera1")
+        calibration_state.stereo_frames_collected = True
+        save_calibration_state(calibration_state)
+    else:
+        print("Stereo frames already collected. Skipping.")
+
+        # Option to recollect if needed
+        if ask_yes_no_question("Do you want to recollect stereo frames?"):
+            save_frames_two_cams("camera0", "camera1")
+            calibration_state.stereo_frames_collected = True
+            save_calibration_state(calibration_state)
 
     """Step4. Use paired calibration pattern frames to obtain camera0 to camera1 rotation and translation"""
-    frames_prefix_c0 = os.path.join("frames_pair", "camera0*")
-    frames_prefix_c1 = os.path.join("frames_pair", "camera1*")
-    R, T = stereo_calibrate(
-        cmtx0, dist0, cmtx1, dist1, frames_prefix_c0, frames_prefix_c1
-    )
+    print_step_banner(4, "PERFORM STEREO CALIBRATION")
+
+    if not calibration_state.stereo_calibrated:
+        frames_prefix_c0 = os.path.join("frames_pair", "camera0*")
+        frames_prefix_c1 = os.path.join("frames_pair", "camera1*")
+        R, T = stereo_calibrate(
+            cmtx0, dist0, cmtx1, dist1, frames_prefix_c0, frames_prefix_c1
+        )
+
+        if R is not None and T is not None:
+            calibration_state.rotation_matrix = R
+            calibration_state.translation_vector = T
+            calibration_state.stereo_calibrated = True
+            save_calibration_state(calibration_state)
+    else:
+        print("Stereo calibration already completed. Loading parameters...")
+        R = calibration_state.rotation_matrix
+        T = calibration_state.translation_vector
+
+        # Option to recalibrate if needed
+        if ask_yes_no_question("Do you want to perform stereo calibration again?"):
+            frames_prefix_c0 = os.path.join("frames_pair", "camera0*")
+            frames_prefix_c1 = os.path.join("frames_pair", "camera1*")
+            R, T = stereo_calibrate(
+                cmtx0, dist0, cmtx1, dist1, frames_prefix_c0, frames_prefix_c1
+            )
+
+            if R is not None and T is not None:
+                calibration_state.rotation_matrix = R
+                calibration_state.translation_vector = T
+                save_calibration_state(calibration_state)
 
     """Step5. Save calibration data where camera0 defines the world space origin."""
+    print_step_banner(5, "SAVE EXTRINSIC PARAMETERS AND VERIFY CALIBRATION")
+
     # camera0 rotation and translation is identity matrix and zeros vector
     R0 = np.eye(3, dtype=np.float32)
     T0 = np.array([0.0, 0.0, 0.0]).reshape((3, 1))
@@ -987,15 +1403,33 @@ if __name__ == "__main__":
     check_calibration("camera0", camera0_data, "camera1", camera1_data, _zshift=60.0)
 
     """Optional. Define a different origin point and save the calibration data"""
-    # Uncomment to define a world coordinate system based on a specific checkerboard position
-    # # Get the world to camera0 rotation and translation
-    # R_W0, T_W0 = get_world_space_origin(cmtx0, dist0, os.path.join('frames_pair', 'camera0_4.png'))
-    # # Get rotation and translation from world directly to camera1
-    # R_W1, T_W1 = get_cam1_to_world_transforms(
-    #     cmtx0, dist0, R_W0, T_W0,
-    #     cmtx1, dist1, R1, T1,
-    #     os.path.join('frames_pair', 'camera0_4.png'),
-    #     os.path.join('frames_pair', 'camera1_4.png')
-    # )
-    # # Save the world-space calibration parameters
-    # save_extrinsic_calibration_parameters(R_W0, T_W0, R_W1, T_W1, prefix='world_to_')
+    print_step_banner(6, "OPTIONAL: DEFINE ALTERNATIVE WORLD ORIGIN (OPTIONAL)")
+
+    if ask_yes_no_question("Do you want to define an alternative world origin?"):
+        print("Define a different world space origin using a checkerboard...")
+        # Get the world to camera0 rotation and translation
+        R_W0, T_W0 = get_world_space_origin(
+            cmtx0, dist0, os.path.join("frames_pair", "camera0_4.png")
+        )
+        # Get rotation and translation from world directly to camera1
+        R_W1, T_W1 = get_cam1_to_world_transforms(
+            cmtx0,
+            dist0,
+            R_W0,
+            T_W0,
+            cmtx1,
+            dist1,
+            R1,
+            T1,
+            os.path.join("frames_pair", "camera0_4.png"),
+            os.path.join("frames_pair", "camera1_4.png"),
+        )
+        # Save the world-space calibration parameters
+        save_extrinsic_calibration_parameters(
+            R_W0, T_W0, R_W1, T_W1, prefix="world_to_"
+        )
+        print("Alternative world origin calibration complete and saved.")
+    else:
+        print("Skipping alternative world origin definition.")
+
+    print("\nCalibration process complete!")
