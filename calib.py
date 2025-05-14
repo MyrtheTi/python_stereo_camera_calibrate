@@ -1,228 +1,350 @@
-import cv2 as cv
+"""
+Stereo Camera Calibration
+
+This script provides functionality for calibrating stereo camera systems.
+It handles intrinsic and extrinsic parameter calibration for stereo vision
+applications using checkerboard pattern detection.
+
+TODO:
+- Add error handling for camera connection failures
+- Implement automatic checkerboard detection parameter tuning
+- Add validation metrics for calibration quality
+- Add option for stereocamera that uses the same camera stream
+- Add progress indicators during calibration processes
+- Implement structured error handling instead of using quit()
+- Add option to save/load calibration state for interrupted sessions
+"""
+
 import glob
-import numpy as np
-import sys
-from scipy import linalg
-import yaml
 import os
+import sys
+from typing import Any, Dict, List, Optional, Tuple
 
-#This will contain the calibration settings from the calibration_settings.yaml file
-calibration_settings = {}
+import cv2
+import numpy as np
+import yaml
+from scipy import linalg
 
-#Given Projection matrices P1 and P2, and pixel coordinates point1 and point2, return triangulated 3D point.
-def DLT(P1, P2, point1, point2):
-
-    A = [point1[1]*P1[2,:] - P1[1,:],
-         P1[0,:] - point1[0]*P1[2,:],
-         point2[1]*P2[2,:] - P2[1,:],
-         P2[0,:] - point2[0]*P2[2,:]
-        ]
-    A = np.array(A).reshape((4,4))
-
-    B = A.transpose() @ A
-    U, s, Vh = linalg.svd(B, full_matrices = False)
-
-    #print('Triangulated point: ')
-    #print(Vh[3,0:3]/Vh[3,3])
-    return Vh[3,0:3]/Vh[3,3]
+# Dictionary to store calibration settings from YAML configuration file
+calibration_settings: Dict[str, Any] = {}
 
 
-#Open and load the calibration_settings.yaml file
-def parse_calibration_settings_file(filename):
-    
+def triangulate_point(
+    projection_matrix1: np.ndarray,
+    projection_matrix2: np.ndarray,
+    point1: np.ndarray,
+    point2: np.ndarray,
+) -> np.ndarray:
+    """
+    Triangulate a 3D point from two 2D projections using Direct Linear Transform (DLT).
+
+    Parameters:
+        projection_matrix1: 3x4 projection matrix of the first camera
+        projection_matrix2: 3x4 projection matrix of the second camera
+        point1: 2D point in the first camera view (x, y)
+        point2: 2D point in the second camera view (x, y)
+
+    Returns:
+        np.ndarray: 3D triangulated point (x, y, z)
+    """
+    # Create coefficient matrix for DLT
+    coefficient_matrix = [
+        point1[1] * projection_matrix1[2, :] - projection_matrix1[1, :],
+        projection_matrix1[0, :] - point1[0] * projection_matrix1[2, :],
+        point2[1] * projection_matrix2[2, :] - projection_matrix2[1, :],
+        projection_matrix2[0, :] - point2[0] * projection_matrix2[2, :],
+    ]
+    coefficient_matrix = np.array(coefficient_matrix).reshape((4, 4))
+
+    # Solve using SVD
+    btb_matrix = coefficient_matrix.transpose() @ coefficient_matrix
+    _, _, v_transpose = linalg.svd(btb_matrix, full_matrices=False)
+
+    # Extract 3D point from the last row of V transpose, normalized
+    return v_transpose[3, 0:3] / v_transpose[3, 3]
+
+
+def parse_calibration_settings_file(filename: str) -> None:
+    """
+    Parse and load calibration settings from a YAML configuration file.
+
+    Parameters:
+        filename: Path to the calibration settings YAML file
+
+    Returns:
+        None. Settings are stored in the global calibration_settings dictionary
+
+    Raises:
+        SystemExit: If file doesn't exist or doesn't contain expected format
+    """
     global calibration_settings
 
     if not os.path.exists(filename):
-        print('File does not exist:', filename)
-        quit()
-    
-    print('Using for calibration settings: ', filename)
+        print("Error: File does not exist:", filename)
+        sys.exit(1)
 
-    with open(filename) as f:
-        calibration_settings = yaml.safe_load(f)
+    print("Using calibration settings from:", filename)
 
-    #rudimentray check to make sure correct file was loaded
-    if 'camera0' not in calibration_settings.keys():
-        print('camera0 key was not found in the settings file. Check if correct calibration_settings.yaml file was passed')
-        quit()
+    with open(filename, "r") as config_file:
+        calibration_settings = yaml.safe_load(config_file)
+
+    # Validate that the configuration contains required settings
+    if "camera0" not in calibration_settings:
+        print(
+            "Error: 'camera0' key not found in the settings file. "
+            "Check if the correct calibration_settings.yaml file was provided."
+        )
+        sys.exit(1)
 
 
-#Open camera stream and save frames
-def save_frames_single_camera(camera_name):
+def save_frames_single_camera(camera_name: str) -> None:
+    """
+    Open camera stream and save frames for calibration.
 
-    #create frames directory
-    if not os.path.exists('frames'):
-        os.mkdir('frames')
+    This function captures frames from a single camera for intrinsic calibration.
 
-    #get settings
+    Parameters:
+        camera_name: Name of the camera as defined in the settings file (e.g., "camera0")
+
+    Returns:
+        None. Frames are saved to the 'frames' directory with naming pattern {camera_name}_{frame_number}.png
+    """
+    # Create frames directory if it doesn't exist
+    if not os.path.exists("frames"):
+        os.mkdir("frames")
+
+    # Get settings from configuration
     camera_device_id = calibration_settings[camera_name]
-    width = calibration_settings['frame_width']
-    height = calibration_settings['frame_height']
-    number_to_save = calibration_settings['mono_calibration_frames']
-    view_resize = calibration_settings['view_resize']
-    cooldown_time = calibration_settings['cooldown']
+    width = calibration_settings["frame_width"]
+    height = calibration_settings["frame_height"]
+    number_to_save = calibration_settings["mono_calibration_frames"]
+    view_resize = calibration_settings["view_resize"]
+    cooldown_time = calibration_settings["cooldown"]
 
-    #open video stream and change resolution.
-    #Note: if unsupported resolution is used, this does NOT raise an error.
-    cap = cv.VideoCapture(camera_device_id)
+    # Open video stream and set resolution
+    # Note: If unsupported resolution is used, this does NOT raise an error
+    cap = cv2.VideoCapture(camera_device_id)
     cap.set(3, width)
     cap.set(4, height)
-    
+
     cooldown = cooldown_time
     start = False
     saved_count = 0
 
     while True:
-    
         ret, frame = cap.read()
-        if ret == False:
-            #if no video data is received, can't calibrate the camera, so exit.
+        if not ret:
             print("No video data received from camera. Exiting...")
             quit()
 
-        frame_small = cv.resize(frame, None, fx = 1/view_resize, fy=1/view_resize)
+        # Create a smaller version of the frame for display
+        frame_small = cv2.resize(frame, None, fx=1 / view_resize, fy=1 / view_resize)
 
         if not start:
-            cv.putText(frame_small, "Press SPACEBAR to start collection frames", (50,50), cv.FONT_HERSHEY_COMPLEX, 1, (0,0,255), 1)
-        
+            cv2.putText(
+                frame_small,
+                "Press SPACEBAR to start collection frames",
+                (50, 50),
+                cv2.FONT_HERSHEY_COMPLEX,
+                1,
+                (0, 0, 255),
+                1,
+            )
+
         if start:
             cooldown -= 1
-            cv.putText(frame_small, "Cooldown: " + str(cooldown), (50,50), cv.FONT_HERSHEY_COMPLEX, 1, (0,255,0), 1)
-            cv.putText(frame_small, "Num frames: " + str(saved_count), (50,100), cv.FONT_HERSHEY_COMPLEX, 1, (0,255,0), 1)
-            
-            #save the frame when cooldown reaches 0.
+            cv2.putText(
+                frame_small,
+                f"Cooldown: {cooldown}",
+                (50, 50),
+                cv2.FONT_HERSHEY_COMPLEX,
+                1,
+                (0, 255, 0),
+                1,
+            )
+            cv2.putText(
+                frame_small,
+                f"Num frames: {saved_count}",
+                (50, 100),
+                cv2.FONT_HERSHEY_COMPLEX,
+                1,
+                (0, 255, 0),
+                1,
+            )
+
+            # Save the frame when cooldown reaches 0
             if cooldown <= 0:
-                savename = os.path.join('frames', camera_name + '_' + str(saved_count) + '.png')
-                cv.imwrite(savename, frame)
+                save_path = os.path.join("frames", f"{camera_name}_{saved_count}.png")
+                cv2.imwrite(save_path, frame)
                 saved_count += 1
                 cooldown = cooldown_time
 
-        cv.imshow('frame_small', frame_small)
-        k = cv.waitKey(1)
-        
-        if k == 27:
-            #if ESC is pressed at any time, the program will exit.
+        cv2.imshow("frame_small", frame_small)
+        key = cv2.waitKey(1)
+
+        if key == 27:  # ESC key
             quit()
 
-        if k == 32:
-            #Press spacebar to start data collection
+        if key == 32:  # SPACE key
             start = True
 
-        #break out of the loop when enough number of frames have been saved
-        if saved_count == number_to_save: break
+        # Break out of the loop when enough frames have been saved
+        if saved_count == number_to_save:
+            break
 
-    cv.destroyAllWindows()
+    cv2.destroyAllWindows()
 
 
-#Calibrate single camera to obtain camera intrinsic parameters from saved frames.
-def calibrate_camera_for_intrinsic_parameters(images_prefix):
-    
-    #NOTE: images_prefix contains camera name: "frames/camera0*".
-    images_names = glob.glob(images_prefix)
+def calibrate_camera_for_intrinsic_parameters(
+    images_prefix: str,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Calibrate a single camera to obtain its intrinsic parameters.
 
-    #read all frames
-    images = [cv.imread(imname, 1) for imname in images_names]
+    This function processes images containing checkerboard patterns to calculate
+    the camera matrix and distortion coefficients.
 
-    #criteria used by checkerboard pattern detector.
-    #Change this if the code can't find the checkerboard. 
-    criteria = (cv.TERM_CRITERIA_EPS + cv.TERM_CRITERIA_MAX_ITER, 100, 0.001)
+    Parameters:
+        images_prefix (str): Path prefix for the calibration images (e.g., "frames/camera0*")
 
-    rows = calibration_settings['checkerboard_rows']
-    columns = calibration_settings['checkerboard_columns']
-    world_scaling = calibration_settings['checkerboard_box_size_scale'] #this will change to user defined length scale
+    Returns:
+        tuple: Camera matrix and distortion coefficients
+            - camera_matrix (numpy.ndarray): 3x3 camera intrinsic matrix
+            - distortion_coeffs (numpy.ndarray): Camera distortion coefficients
+    """
+    # Find all images matching the prefix pattern
+    image_paths = glob.glob(images_prefix)
 
-    #coordinates of squares in the checkerboard world space
-    objp = np.zeros((rows*columns,3), np.float32)
-    objp[:,:2] = np.mgrid[0:rows,0:columns].T.reshape(-1,2)
-    objp = world_scaling* objp
+    # Read all calibration frames
+    images = [cv2.imread(image_path, 1) for image_path in image_paths]
 
-    #frame dimensions. Frames should be the same size.
+    # Criteria used by checkerboard pattern detector
+    # (type, max_iterations, epsilon)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.001)
+
+    rows = calibration_settings["checkerboard_rows"]
+    columns = calibration_settings["checkerboard_columns"]
+    world_scaling = calibration_settings["checkerboard_box_size_scale"]
+
+    # Define 3D coordinates of checkerboard corners in the checkerboard coordinate system
+    checkerboard_points_3d = np.zeros((rows * columns, 3), np.float32)
+    checkerboard_points_3d[:, :2] = np.mgrid[0:rows, 0:columns].T.reshape(-1, 2)
+    checkerboard_points_3d = world_scaling * checkerboard_points_3d
+
+    # Get frame dimensions (assuming all frames have the same size)
     width = images[0].shape[1]
     height = images[0].shape[0]
 
-    #Pixel coordinates of checkerboards
-    imgpoints = [] # 2d points in image plane.
+    # Pixel coordinates of detected checkerboard corners
+    image_points = []  # 2D points in image plane
 
-    #coordinates of the checkerboard in checkerboard world space.
-    objpoints = [] # 3d point in real world space
+    # Corresponding 3D coordinates in world space
+    object_points = []  # 3D points in real world space
 
+    for frame in images:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    for i, frame in enumerate(images):
-        gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+        # Find the checkerboard corners
+        found_checkerboard, corners = cv2.findChessboardCorners(
+            gray, (rows, columns), None
+        )
 
-        #find the checkerboard
-        ret, corners = cv.findChessboardCorners(gray, (rows, columns), None)
+        if found_checkerboard:
+            # Refine corner detection
+            corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+            cv2.drawChessboardCorners(
+                frame, (rows, columns), corners, found_checkerboard
+            )
+            cv2.putText(
+                frame,
+                'If detected points are poor, press "s" to skip this sample',
+                (25, 25),
+                cv2.FONT_HERSHEY_COMPLEX,
+                1,
+                (0, 0, 255),
+                1,
+            )
 
-        if ret == True:
+            cv2.imshow("img", frame)
+            k = cv2.waitKey(0)
 
-            #Convolution size used to improve corner detection. Don't make this too large.
-            conv_size = (11, 11)
-
-            #opencv can attempt to improve the checkerboard coordinates
-            corners = cv.cornerSubPix(gray, corners, conv_size, (-1, -1), criteria)
-            cv.drawChessboardCorners(frame, (rows,columns), corners, ret)
-            cv.putText(frame, 'If detected points are poor, press "s" to skip this sample', (25, 25), cv.FONT_HERSHEY_COMPLEX, 1, (0,0,255), 1)
-
-            cv.imshow('img', frame)
-            k = cv.waitKey(0)
-
-            if k & 0xFF == ord('s'):
-                print('skipping')
+            if k & 0xFF == ord("s"):
+                print("skipping")
                 continue
 
-            objpoints.append(objp)
-            imgpoints.append(corners)
+            object_points.append(checkerboard_points_3d)
+            image_points.append(corners)
+
+    cv2.destroyAllWindows()
+    ret, camera_matrix, distortion_coeffs, rvecs, tvecs = cv2.calibrateCamera(
+        object_points, image_points, (width, height), None, None
+    )
+    print("rmse:", ret)
+    print("camera matrix:\n", camera_matrix)
+    print("distortion coeffs:", distortion_coeffs)
+
+    return camera_matrix, distortion_coeffs
 
 
-    cv.destroyAllWindows()
-    ret, cmtx, dist, rvecs, tvecs = cv.calibrateCamera(objpoints, imgpoints, (width, height), None, None)
-    print('rmse:', ret)
-    print('camera matrix:\n', cmtx)
-    print('distortion coeffs:', dist)
+def save_camera_intrinsics(
+    camera_matrix: np.ndarray, distortion_coeffs: np.ndarray, camera_name: str
+) -> None:
+    """
+    Save camera intrinsic parameters to a file.
 
-    return cmtx, dist
+    Parameters:
+        camera_matrix: 3x3 camera intrinsic matrix
+        distortion_coeffs: Camera distortion coefficients
+        camera_name: Name of the camera (e.g., "camera0")
 
-#save camera intrinsic parameters to file
-def save_camera_intrinsics(camera_matrix, distortion_coefs, camera_name):
+    Returns:
+        None. Parameters are saved to 'camera_parameters/{camera_name}_intrinsics.dat'
+    """
+    # Create folder if it does not exist
+    if not os.path.exists("camera_parameters"):
+        os.mkdir("camera_parameters")
 
-    #create folder if it does not exist
-    if not os.path.exists('camera_parameters'):
-        os.mkdir('camera_parameters')
+    out_filename = os.path.join("camera_parameters", f"{camera_name}_intrinsics.dat")
+    with open(out_filename, "w") as output_file:
+        output_file.write("intrinsic:\n")
+        for row in camera_matrix:
+            for value in row:
+                output_file.write(f"{value} ")
+            output_file.write("\n")
 
-    out_filename = os.path.join('camera_parameters', camera_name + '_intrinsics.dat')
-    outf = open(out_filename, 'w')
-
-    outf.write('intrinsic:\n')
-    for l in camera_matrix:
-        for en in l:
-            outf.write(str(en) + ' ')
-        outf.write('\n')
-
-    outf.write('distortion:\n')
-    for en in distortion_coefs[0]:
-        outf.write(str(en) + ' ')
-    outf.write('\n')
+        output_file.write("distortion:\n")
+        for value in distortion_coeffs[0]:
+            output_file.write(f"{value} ")
+        output_file.write("\n")
 
 
-#open both cameras and take calibration frames
-def save_frames_two_cams(camera0_name, camera1_name):
+def save_frames_two_cams(camera0_name: str, camera1_name: str) -> None:
+    """
+    Open both cameras and capture synchronized frames for stereo calibration.
 
-    #create frames directory
-    if not os.path.exists('frames_pair'):
-        os.mkdir('frames_pair')
+    Parameters:
+        camera0_name: Name of the first camera as defined in the settings
+        camera1_name: Name of the second camera as defined in the settings
 
-    #settings for taking data
-    view_resize = calibration_settings['view_resize']
-    cooldown_time = calibration_settings['cooldown']    
-    number_to_save = calibration_settings['stereo_calibration_frames']
+    Returns:
+        None. Frame pairs are saved to the 'frames_pair' directory
+    """
+    # Create frames directory for pairs if it doesn't exist
+    if not os.path.exists("frames_pair"):
+        os.mkdir("frames_pair")
 
-    #open the video streams
-    cap0 = cv.VideoCapture(calibration_settings[camera0_name])
-    cap1 = cv.VideoCapture(calibration_settings[camera1_name])
+    # Get settings for data capture
+    view_resize = calibration_settings["view_resize"]
+    cooldown_time = calibration_settings["cooldown"]
+    number_to_save = calibration_settings["stereo_calibration_frames"]
 
-    #set camera resolutions
-    width = calibration_settings['frame_width']
-    height = calibration_settings['frame_height']
+    # Open video streams for both cameras
+    cap0 = cv2.VideoCapture(calibration_settings[camera0_name])
+    cap1 = cv2.VideoCapture(calibration_settings[camera1_name])
+
+    # Set camera resolutions
+    width = calibration_settings["frame_width"]
+    height = calibration_settings["frame_height"]
     cap0.set(3, width)
     cap0.set(4, height)
     cap1.set(3, width)
@@ -231,148 +353,297 @@ def save_frames_two_cams(camera0_name, camera1_name):
     cooldown = cooldown_time
     start = False
     saved_count = 0
-    while True:
 
+    while True:
         ret0, frame0 = cap0.read()
         ret1, frame1 = cap1.read()
 
         if not ret0 or not ret1:
-            print('Cameras not returning video data. Exiting...')
+            print("Cameras not returning video data. Exiting...")
             quit()
 
-        frame0_small = cv.resize(frame0, None, fx=1./view_resize, fy=1./view_resize)
-        frame1_small = cv.resize(frame1, None, fx=1./view_resize, fy=1./view_resize)
+        # Create smaller versions of frames for display
+        frame0_small = cv2.resize(
+            frame0, None, fx=1.0 / view_resize, fy=1.0 / view_resize
+        )
+        frame1_small = cv2.resize(
+            frame1, None, fx=1.0 / view_resize, fy=1.0 / view_resize
+        )
 
         if not start:
-            cv.putText(frame0_small, "Make sure both cameras can see the calibration pattern well", (50,50), cv.FONT_HERSHEY_COMPLEX, 1, (0,0,255), 1)
-            cv.putText(frame0_small, "Press SPACEBAR to start collection frames", (50,100), cv.FONT_HERSHEY_COMPLEX, 1, (0,0,255), 1)
-        
+            cv2.putText(
+                frame0_small,
+                "Make sure both cameras can see the calibration pattern well",
+                (50, 50),
+                cv2.FONT_HERSHEY_COMPLEX,
+                1,
+                (0, 0, 255),
+                1,
+            )
+            cv2.putText(
+                frame0_small,
+                "Press SPACEBAR to start collection frames",
+                (50, 100),
+                cv2.FONT_HERSHEY_COMPLEX,
+                1,
+                (0, 0, 255),
+                1,
+            )
+
         if start:
             cooldown -= 1
-            cv.putText(frame0_small, "Cooldown: " + str(cooldown), (50,50), cv.FONT_HERSHEY_COMPLEX, 1, (0,255,0), 1)
-            cv.putText(frame0_small, "Num frames: " + str(saved_count), (50,100), cv.FONT_HERSHEY_COMPLEX, 1, (0,255,0), 1)
-            
-            cv.putText(frame1_small, "Cooldown: " + str(cooldown), (50,50), cv.FONT_HERSHEY_COMPLEX, 1, (0,255,0), 1)
-            cv.putText(frame1_small, "Num frames: " + str(saved_count), (50,100), cv.FONT_HERSHEY_COMPLEX, 1, (0,255,0), 1)
+            # Display cooldown and frame count on both camera views
+            for frame in [frame0_small, frame1_small]:
+                cv2.putText(
+                    frame,
+                    f"Cooldown: {cooldown}",
+                    (50, 50),
+                    cv2.FONT_HERSHEY_COMPLEX,
+                    1,
+                    (0, 255, 0),
+                    1,
+                )
+                cv2.putText(
+                    frame,
+                    f"Num frames: {saved_count}",
+                    (50, 100),
+                    cv2.FONT_HERSHEY_COMPLEX,
+                    1,
+                    (0, 255, 0),
+                    1,
+                )
 
-            #save the frame when cooldown reaches 0.
+            # Save the frame pair when cooldown reaches 0
             if cooldown <= 0:
-                savename = os.path.join('frames_pair', camera0_name + '_' + str(saved_count) + '.png')
-                cv.imwrite(savename, frame0)
-
-                savename = os.path.join('frames_pair', camera1_name + '_' + str(saved_count) + '.png')
-                cv.imwrite(savename, frame1)
-
+                cv2.imwrite(
+                    os.path.join("frames_pair", f"{camera0_name}_{saved_count}.png"),
+                    frame0,
+                )
+                cv2.imwrite(
+                    os.path.join("frames_pair", f"{camera1_name}_{saved_count}.png"),
+                    frame1,
+                )
                 saved_count += 1
                 cooldown = cooldown_time
 
-        cv.imshow('frame0_small', frame0_small)
-        cv.imshow('frame1_small', frame1_small)
-        k = cv.waitKey(1)
-        
-        if k == 27:
-            #if ESC is pressed at any time, the program will exit.
+        cv2.imshow("frame0_small", frame0_small)
+        cv2.imshow("frame1_small", frame1_small)
+        key = cv2.waitKey(1)
+
+        if key == 27:  # ESC key
             quit()
 
-        if k == 32:
-            #Press spacebar to start data collection
+        if key == 32:  # SPACE key
             start = True
 
-        #break out of the loop when enough number of frames have been saved
-        if saved_count == number_to_save: break
+        # Break out of the loop when enough frames have been saved
+        if saved_count == number_to_save:
+            break
 
-    cv.destroyAllWindows()
+    cv2.destroyAllWindows()
 
 
-#open paired calibration frames and stereo calibrate for cam0 to cam1 coorindate transformations
-def stereo_calibrate(mtx0, dist0, mtx1, dist1, frames_prefix_c0, frames_prefix_c1):
-    #read the synched frames
-    c0_images_names = sorted(glob.glob(frames_prefix_c0))
-    c1_images_names = sorted(glob.glob(frames_prefix_c1))
+def stereo_calibrate(
+    mtx0: np.ndarray,
+    dist0: np.ndarray,
+    mtx1: np.ndarray,
+    dist1: np.ndarray,
+    frames_prefix_c0: str,
+    frames_prefix_c1: str,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Perform stereo calibration to find transformation between two cameras.
 
-    #open images
-    c0_images = [cv.imread(imname, 1) for imname in c0_images_names]
-    c1_images = [cv.imread(imname, 1) for imname in c1_images_names]
+    This uses paired images with visible checkerboard patterns to calculate
+    the rotation and translation from camera0 to camera1.
 
-    #change this if stereo calibration not good.
-    criteria = (cv.TERM_CRITERIA_EPS + cv.TERM_CRITERIA_MAX_ITER, 100, 0.001)
+    Parameters:
+        mtx0: Intrinsic matrix of the first camera
+        dist0: Distortion coefficients of the first camera
+        mtx1: Intrinsic matrix of the second camera
+        dist1: Distortion coefficients of the second camera
+        frames_prefix_c0: Path prefix for the first camera's frames
+        frames_prefix_c1: Path prefix for the second camera's frames
 
-    #calibration pattern settings
-    rows = calibration_settings['checkerboard_rows']
-    columns = calibration_settings['checkerboard_columns']
-    world_scaling = calibration_settings['checkerboard_box_size_scale']
+    Returns:
+        Tuple[np.ndarray, np.ndarray]: Rotation matrix and translation vector from camera0 to camera1
+    """
+    # Read the synchronized frame pairs
+    c0_images_paths = sorted(glob.glob(frames_prefix_c0))
+    c1_images_paths = sorted(glob.glob(frames_prefix_c1))
 
-    #coordinates of squares in the checkerboard world space
-    objp = np.zeros((rows*columns,3), np.float32)
-    objp[:,:2] = np.mgrid[0:rows,0:columns].T.reshape(-1,2)
-    objp = world_scaling* objp
+    # Load all image pairs
+    c0_images = [cv2.imread(image_path, 1) for image_path in c0_images_paths]
+    c1_images = [cv2.imread(image_path, 1) for image_path in c1_images_paths]
 
-    #frame dimensions. Frames should be the same size.
+    # Criteria for subpixel refinement
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.001)
+
+    # Get calibration pattern settings
+    rows = calibration_settings["checkerboard_rows"]
+    columns = calibration_settings["checkerboard_columns"]
+    world_scaling = calibration_settings["checkerboard_box_size_scale"]
+
+    # Define 3D coordinates of checkerboard corners in world space
+    checkerboard_points_3d = np.zeros((rows * columns, 3), np.float32)
+    checkerboard_points_3d[:, :2] = np.mgrid[0:rows, 0:columns].T.reshape(-1, 2)
+    checkerboard_points_3d = world_scaling * checkerboard_points_3d
+
+    # Get frame dimensions
     width = c0_images[0].shape[1]
     height = c0_images[0].shape[0]
 
-    #Pixel coordinates of checkerboards
-    imgpoints_left = [] # 2d points in image plane.
-    imgpoints_right = []
+    # Store detected checkerboard corner points
+    image_points_left = []  # 2D points in camera0 image plane
+    image_points_right = []  # 2D points in camera1 image plane
+    object_points = []  # Corresponding 3D points in checkerboard space
 
-    #coordinates of the checkerboard in checkerboard world space.
-    objpoints = [] # 3d point in real world space
-
+    # Process each pair of frames
     for frame0, frame1 in zip(c0_images, c1_images):
-        gray1 = cv.cvtColor(frame0, cv.COLOR_BGR2GRAY)
-        gray2 = cv.cvtColor(frame1, cv.COLOR_BGR2GRAY)
-        c_ret1, corners1 = cv.findChessboardCorners(gray1, (rows, columns), None)
-        c_ret2, corners2 = cv.findChessboardCorners(gray2, (rows, columns), None)
+        gray0 = cv2.cvtColor(frame0, cv2.COLOR_BGR2GRAY)
+        gray1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
 
-        if c_ret1 == True and c_ret2 == True:
+        # Find checkerboard corners in both images
+        ret0, corners0 = cv2.findChessboardCorners(gray0, (rows, columns), None)
+        ret1, corners1 = cv2.findChessboardCorners(gray1, (rows, columns), None)
 
-            corners1 = cv.cornerSubPix(gray1, corners1, (11, 11), (-1, -1), criteria)
-            corners2 = cv.cornerSubPix(gray2, corners2, (11, 11), (-1, -1), criteria)
+        # If checkerboard is found in both images
+        if ret0 and ret1:
+            # Refine corner locations to subpixel accuracy
+            corners0 = cv2.cornerSubPix(gray0, corners0, (11, 11), (-1, -1), criteria)
+            corners1 = cv2.cornerSubPix(gray1, corners1, (11, 11), (-1, -1), criteria)
 
-            p0_c1 = corners1[0,0].astype(np.int32)
-            p0_c2 = corners2[0,0].astype(np.int32)
+            # Mark the first corner (origin) with an "O"
+            p0_c0 = corners0[0, 0].astype(np.int32)
+            p0_c1 = corners1[0, 0].astype(np.int32)
 
-            cv.putText(frame0, 'O', (p0_c1[0], p0_c1[1]), cv.FONT_HERSHEY_COMPLEX, 1, (0,0,255), 1)
-            cv.drawChessboardCorners(frame0, (rows,columns), corners1, c_ret1)
-            cv.imshow('img', frame0)
+            # Draw checkerboard corners and mark origin on both frames
+            for frame, corners, ret, origin_point in [
+                (frame0, corners0, ret0, p0_c0),
+                (frame1, corners1, ret1, p0_c1),
+            ]:
+                cv2.putText(
+                    frame,
+                    "O",
+                    (origin_point[0], origin_point[1]),
+                    cv2.FONT_HERSHEY_COMPLEX,
+                    1,
+                    (0, 0, 255),
+                    1,
+                )
+                cv2.drawChessboardCorners(frame, (rows, columns), corners, ret)
 
-            cv.putText(frame1, 'O', (p0_c2[0], p0_c2[1]), cv.FONT_HERSHEY_COMPLEX, 1, (0,0,255), 1)
-            cv.drawChessboardCorners(frame1, (rows,columns), corners2, c_ret2)
-            cv.imshow('img2', frame1)
-            k = cv.waitKey(0)
+            # Display frames with detected corners
+            cv2.imshow("Camera 0", frame0)
+            cv2.imshow("Camera 1", frame1)
+            key = cv2.waitKey(0)
 
-            if k & 0xFF == ord('s'):
-                print('skipping')
+            # Skip this pair if 's' is pressed
+            if key & 0xFF == ord("s"):
+                print("Skipping this image pair")
                 continue
 
-            objpoints.append(objp)
-            imgpoints_left.append(corners1)
-            imgpoints_right.append(corners2)
+            # Store points for calibration
+            object_points.append(checkerboard_points_3d)
+            image_points_left.append(corners0)
+            image_points_right.append(corners1)
 
-    stereocalibration_flags = cv.CALIB_FIX_INTRINSIC
-    ret, CM1, dist0, CM2, dist1, R, T, E, F = cv.stereoCalibrate(objpoints, imgpoints_left, imgpoints_right, mtx0, dist0,
-                                                                 mtx1, dist1, (width, height), criteria = criteria, flags = stereocalibration_flags)
+    # Perform stereo calibration, keeping intrinsics fixed
+    stereocalibration_flags = cv2.CALIB_FIX_INTRINSIC
+    (
+        ret,
+        _,
+        _,
+        _,
+        _,
+        rotation_matrix,
+        translation_vector,
+        essential_matrix,
+        fundamental_matrix,
+    ) = cv2.stereoCalibrate(
+        object_points,
+        image_points_left,
+        image_points_right,
+        mtx0,
+        dist0,
+        mtx1,
+        dist1,
+        (width, height),
+        criteria=criteria,
+        flags=stereocalibration_flags,
+    )
 
-    print('rmse: ', ret)
-    cv.destroyAllWindows()
-    return R, T
+    print("Stereo calibration RMSE:", ret)
+    cv2.destroyAllWindows()
+    return rotation_matrix, translation_vector
 
-#Converts Rotation matrix R and Translation vector T into a homogeneous representation matrix
-def _make_homogeneous_rep_matrix(R, t):
-    P = np.zeros((4,4))
-    P[:3,:3] = R
-    P[:3, 3] = t.reshape(3)
-    P[3,3] = 1
- 
-    return P
-# Turn camera calibration data into projection matrix
-def get_projection_matrix(cmtx, R, T):
-    P = cmtx @ _make_homogeneous_rep_matrix(R, T)[:3,:]
-    return P
 
-# After calibrating, we can see shifted coordinate axes in the video feeds directly
-def check_calibration(camera0_name, camera0_data, camera1_name, camera1_data, _zshift = 50.):
-    
+def _make_homogeneous_rep_matrix(
+    rotation_matrix: np.ndarray, translation_vector: np.ndarray
+) -> np.ndarray:
+    """
+    Convert rotation matrix and translation vector to a 4x4 homogeneous transformation matrix.
+
+    Parameters:
+        rotation_matrix: 3x3 rotation matrix
+        translation_vector: 3x1 translation vector
+
+    Returns:
+        np.ndarray: 4x4 homogeneous transformation matrix
+    """
+    transform_matrix = np.zeros((4, 4))
+    transform_matrix[:3, :3] = rotation_matrix
+    transform_matrix[:3, 3] = translation_vector.reshape(3)
+    transform_matrix[3, 3] = 1
+
+    return transform_matrix
+
+
+def get_projection_matrix(
+    camera_matrix: np.ndarray,
+    rotation_matrix: np.ndarray,
+    translation_vector: np.ndarray,
+) -> np.ndarray:
+    """
+    Compute the camera projection matrix from intrinsic and extrinsic parameters.
+
+    Parameters:
+        camera_matrix: 3x3 camera intrinsic matrix
+        rotation_matrix: 3x3 rotation matrix
+        translation_vector: 3x1 translation vector
+
+    Returns:
+        np.ndarray: 3x4 camera projection matrix
+    """
+    # Create homogeneous transformation matrix and extract the 3x4 component
+    homogeneous_matrix = _make_homogeneous_rep_matrix(
+        rotation_matrix, translation_vector
+    )
+    projection_matrix = camera_matrix @ homogeneous_matrix[:3, :]
+    return projection_matrix
+
+
+def check_calibration(
+    camera0_name: str,
+    camera0_data: List[np.ndarray],
+    camera1_name: str,
+    camera1_data: List[np.ndarray],
+    _zshift: float = 50.0,
+) -> None:
+    """
+    Visualize calibration results by projecting 3D axes onto both camera views.
+
+    Parameters:
+        camera0_name: Name of the first camera as defined in settings
+        camera0_data: List containing [camera_matrix, distortion, rotation_matrix, translation_vector] for camera0
+        camera1_name: Name of the second camera as defined in settings
+        camera1_data: List containing [camera_matrix, distortion, rotation_matrix, translation_vector] for camera1
+        _zshift: Distance to shift the coordinate axes away from cameras for better visibility
+
+    Returns:
+        None. Displays live video feeds with overlaid 3D axes
+    """
+    # Extract camera parameters from the data lists
     cmtx0 = np.array(camera0_data[0])
     dist0 = np.array(camera0_data[1])
     R0 = np.array(camera0_data[2])
@@ -382,245 +653,349 @@ def check_calibration(camera0_name, camera0_data, camera1_name, camera1_data, _z
     R1 = np.array(camera1_data[2])
     T1 = np.array(camera1_data[3])
 
+    # Calculate projection matrices for both cameras
     P0 = get_projection_matrix(cmtx0, R0, T0)
     P1 = get_projection_matrix(cmtx1, R1, T1)
 
-    #define coordinate axes in 3D space. These are just the usual coorindate vectors
-    coordinate_points = np.array([[0.,0.,0.],
-                                  [1.,0.,0.],
-                                  [0.,1.,0.],
-                                  [0.,0.,1.]])
-    z_shift = np.array([0.,0.,_zshift]).reshape((1, 3))
-    #increase the size of the coorindate axes and shift in the z direction
-    draw_axes_points = 5 * coordinate_points + z_shift
+    # Define coordinate axes in 3D space (origin, X, Y, Z)
+    coordinate_points = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    )
 
-    #project 3D points to each camera view manually. This can also be done using cv.projectPoints()
-    #Note that this uses homogenous coordinate formulation
+    # Shift axes in Z direction for better visibility and scale them
+    z_shift = np.array([0.0, 0.0, _zshift]).reshape((1, 3))
+    axes_points_3d = 5 * coordinate_points + z_shift
+
+    # Project 3D axes points to each camera view
     pixel_points_camera0 = []
     pixel_points_camera1 = []
-    for _p in draw_axes_points:
-        X = np.array([_p[0], _p[1], _p[2], 1.])
-        
-        #project to camera0
-        uv = P0 @ X
-        uv = np.array([uv[0], uv[1]])/uv[2]
-        pixel_points_camera0.append(uv)
+    for point_3d in axes_points_3d:
+        # Convert to homogeneous coordinates
+        point_homogeneous = np.array([point_3d[0], point_3d[1], point_3d[2], 1.0])
 
-        #project to camera1
-        uv = P1 @ X
-        uv = np.array([uv[0], uv[1]])/uv[2]
-        pixel_points_camera1.append(uv)
+        # Project to camera0
+        point_projected = P0 @ point_homogeneous
+        pixel_coords = (
+            np.array([point_projected[0], point_projected[1]]) / point_projected[2]
+        )
+        pixel_points_camera0.append(pixel_coords)
 
-    #these contain the pixel coorindates in each camera view as: (pxl_x, pxl_y)
+        # Project to camera1
+        point_projected = P1 @ point_homogeneous
+        pixel_coords = (
+            np.array([point_projected[0], point_projected[1]]) / point_projected[2]
+        )
+        pixel_points_camera1.append(pixel_coords)
+
+    # Convert lists to numpy arrays for easier handling
     pixel_points_camera0 = np.array(pixel_points_camera0)
     pixel_points_camera1 = np.array(pixel_points_camera1)
 
-    #open the video streams
-    cap0 = cv.VideoCapture(calibration_settings[camera0_name])
-    cap1 = cv.VideoCapture(calibration_settings[camera1_name])
+    # Open video streams
+    cap0 = cv2.VideoCapture(calibration_settings[camera0_name])
+    cap1 = cv2.VideoCapture(calibration_settings[camera1_name])
 
-    #set camera resolutions
-    width = calibration_settings['frame_width']
-    height = calibration_settings['frame_height']
+    # Set camera resolutions
+    width = calibration_settings["frame_width"]
+    height = calibration_settings["frame_height"]
     cap0.set(3, width)
     cap0.set(4, height)
     cap1.set(3, width)
     cap1.set(4, height)
 
-    while True:
+    # Use RGB colors to represent XYZ axes
+    colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]  # Red, Green, Blue for X, Y, Z
 
+    while True:
         ret0, frame0 = cap0.read()
         ret1, frame1 = cap1.read()
 
         if not ret0 or not ret1:
-            print('Video stream not returning frame data')
+            print("Video stream not returning frame data")
             quit()
 
-        #follow RGB colors to indicate XYZ axes respectively
-        colors = [(0,0,255), (0,255,0), (255,0,0)]
-        #draw projections to camera0
-        origin = tuple(pixel_points_camera0[0].astype(np.int32))
-        for col, _p in zip(colors, pixel_points_camera0[1:]):
-            _p = tuple(_p.astype(np.int32))
-            cv.line(frame0, origin, _p, col, 2)
-        
-        #draw projections to camera1
-        origin = tuple(pixel_points_camera1[0].astype(np.int32))
-        for col, _p in zip(colors, pixel_points_camera1[1:]):
-            _p = tuple(_p.astype(np.int32))
-            cv.line(frame1, origin, _p, col, 2)
+        # Draw coordinate axes on camera0 view
+        origin0 = tuple(pixel_points_camera0[0].astype(np.int32))
+        for color, point in zip(colors, pixel_points_camera0[1:]):
+            point_pixel = tuple(point.astype(np.int32))
+            cv2.line(frame0, origin0, point_pixel, color, 2)
 
-        cv.imshow('frame0', frame0)
-        cv.imshow('frame1', frame1)
+        # Draw coordinate axes on camera1 view
+        origin1 = tuple(pixel_points_camera1[0].astype(np.int32))
+        for color, point in zip(colors, pixel_points_camera1[1:]):
+            point_pixel = tuple(point.astype(np.int32))
+            cv2.line(frame1, origin1, point_pixel, color, 2)
 
-        k = cv.waitKey(1)
-        if k == 27: break
+        # Display the frames with projected axes
+        cv2.imshow("Camera 0", frame0)
+        cv2.imshow("Camera 1", frame1)
 
-    cv.destroyAllWindows()
+        key = cv2.waitKey(1)
+        if key == 27:  # ESC key
+            break
 
-def get_world_space_origin(cmtx, dist, img_path):
+    cv2.destroyAllWindows()
 
-    frame = cv.imread(img_path, 1)
 
-    #calibration pattern settings
-    rows = calibration_settings['checkerboard_rows']
-    columns = calibration_settings['checkerboard_columns']
-    world_scaling = calibration_settings['checkerboard_box_size_scale']
+def get_world_space_origin(
+    camera_matrix: np.ndarray, distortion_coeffs: np.ndarray, img_path: str
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Calculate rotation and translation from world space to camera space.
 
-    #coordinates of squares in the checkerboard world space
-    objp = np.zeros((rows*columns,3), np.float32)
-    objp[:,:2] = np.mgrid[0:rows,0:columns].T.reshape(-1,2)
-    objp = world_scaling* objp
+    Uses a reference image with checkerboard pattern to define world origin.
 
-    gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
-    ret, corners = cv.findChessboardCorners(gray, (rows, columns), None)
+    Parameters:
+        camera_matrix: Camera intrinsic matrix
+        distortion_coeffs: Camera distortion coefficients
+        img_path: Path to reference image with checkerboard
 
-    cv.drawChessboardCorners(frame, (rows,columns), corners, ret)
-    cv.putText(frame, "If you don't see detected points, try with a different image", (50,50), cv.FONT_HERSHEY_COMPLEX, 1, (0,0,255), 1)
-    cv.imshow('img', frame)
-    cv.waitKey(0)
+    Returns:
+        Tuple[np.ndarray, np.ndarray]: Rotation matrix and translation vector from world to camera
+    """
+    # Read the reference image
+    frame = cv2.imread(img_path, 1)
 
-    ret, rvec, tvec = cv.solvePnP(objp, corners, cmtx, dist)
-    R, _  = cv.Rodrigues(rvec) #rvec is Rotation matrix in Rodrigues vector form
+    # Get checkerboard pattern settings
+    rows = calibration_settings["checkerboard_rows"]
+    columns = calibration_settings["checkerboard_columns"]
+    world_scaling = calibration_settings["checkerboard_box_size_scale"]
 
-    return R, tvec
+    # Define 3D coordinates of checkerboard corners in world space
+    object_points = np.zeros((rows * columns, 3), np.float32)
+    object_points[:, :2] = np.mgrid[0:rows, 0:columns].T.reshape(-1, 2)
+    object_points = world_scaling * object_points
 
-def get_cam1_to_world_transforms(cmtx0, dist0, R_W0, T_W0, 
-                                 cmtx1, dist1, R_01, T_01,
-                                 image_path0,
-                                 image_path1):
+    # Find checkerboard corners in the image
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    found_checkerboard, corners = cv2.findChessboardCorners(gray, (rows, columns), None)
 
-    frame0 = cv.imread(image_path0, 1)
-    frame1 = cv.imread(image_path1, 1)
+    # Draw detected corners on the image for visualization
+    cv2.drawChessboardCorners(frame, (rows, columns), corners, found_checkerboard)
+    cv2.putText(
+        frame,
+        "If you don't see detected points, try with a different image",
+        (50, 50),
+        cv2.FONT_HERSHEY_COMPLEX,
+        1,
+        (0, 0, 255),
+        1,
+    )
+    cv2.imshow("Reference Image", frame)
+    cv2.waitKey(0)
 
-    unitv_points = 5 * np.array([[0,0,0], [1,0,0], [0,1,0], [0,0,1]], dtype = 'float32').reshape((4,1,3))
-    #axes colors are RGB format to indicate XYZ axes.
-    colors = [(0,0,255), (0,255,0), (255,0,0)]
+    # Solve the PnP problem to get rotation and translation
+    _, rvec, tvec = cv2.solvePnP(
+        object_points, corners, camera_matrix, distortion_coeffs
+    )
 
-    #project origin points to frame 0
-    points, _ = cv.projectPoints(unitv_points, R_W0, T_W0, cmtx0, dist0)
-    points = points.reshape((4,2)).astype(np.int32)
-    origin = tuple(points[0])
-    for col, _p in zip(colors, points[1:]):
-        _p = tuple(_p.astype(np.int32))
-        cv.line(frame0, origin, _p, col, 2)
+    # Convert rotation vector to rotation matrix
+    rotation_matrix, _ = cv2.Rodrigues(rvec)
 
-    #project origin points to frame1
+    return rotation_matrix, tvec
+
+
+def get_cam1_to_world_transforms(
+    cmtx0: np.ndarray,
+    dist0: np.ndarray,
+    R_W0: np.ndarray,
+    T_W0: np.ndarray,
+    cmtx1: np.ndarray,
+    dist1: np.ndarray,
+    R_01: np.ndarray,
+    T_01: np.ndarray,
+    image_path0: str,
+    image_path1: str,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Calculate transformation from world space to camera1 space.
+
+    This function computes and visualizes the world-to-camera1 transformation.
+
+    Parameters:
+        cmtx0: Intrinsic matrix of camera0
+        dist0: Distortion coefficients of camera0
+        R_W0: Rotation matrix from world to camera0
+        T_W0: Translation vector from world to camera0
+        cmtx1: Intrinsic matrix of camera1
+        dist1: Distortion coefficients of camera1
+        R_01: Rotation matrix from camera0 to camera1
+        T_01: Translation vector from camera0 to camera1
+        image_path0: Path to reference image from camera0
+        image_path1: Path to reference image from camera1
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray]: Rotation matrix and translation vector from world to camera1
+    """
+    # Load reference images
+    frame0 = cv2.imread(image_path0, 1)
+    frame1 = cv2.imread(image_path1, 1)
+
+    # Define unit coordinate frame points (origin, X, Y, Z)
+    unit_points = 5 * np.array(
+        [[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype="float32"
+    ).reshape((4, 1, 3))
+
+    # RGB colors to indicate XYZ axes
+    colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]
+
+    # Project axis points onto camera0 view
+    points_projected, _ = cv2.projectPoints(unit_points, R_W0, T_W0, cmtx0, dist0)
+    points_2d = points_projected.reshape((4, 2)).astype(np.int32)
+
+    # Draw axes on camera0 image
+    origin = tuple(points_2d[0])
+    for color, point in zip(colors, points_2d[1:]):
+        point_pixel = tuple(point.astype(np.int32))
+        cv2.line(frame0, origin, point_pixel, color, 2)
+    # Compute camera1 to world transformation
+
+    # R_W1 = R_01 * R_W0  (matrix multiplication)
+    # T_W1 = R_01 * T_W0 + T_01
     R_W1 = R_01 @ R_W0
     T_W1 = R_01 @ T_W0 + T_01
-    points, _ = cv.projectPoints(unitv_points, R_W1, T_W1, cmtx1, dist1)
-    points = points.reshape((4,2)).astype(np.int32)
-    origin = tuple(points[0])
-    for col, _p in zip(colors, points[1:]):
-        _p = tuple(_p.astype(np.int32))
-        cv.line(frame1, origin, _p, col, 2)
 
-    cv.imshow('frame0', frame0)
-    cv.imshow('frame1', frame1)
-    cv.waitKey(0)
+    # Project axis points onto camera1 view
+    points_projected, _ = cv2.projectPoints(unit_points, R_W1, T_W1, cmtx1, dist1)
+    points_2d = points_projected.reshape((4, 2)).astype(np.int32)
+
+    # Draw axes on camera1 image
+    origin = tuple(points_2d[0])
+    for color, point in zip(colors, points_2d[1:]):
+        point_pixel = tuple(point.astype(np.int32))
+        cv2.line(frame1, origin, point_pixel, color, 2)
+
+    # Display the visualization
+    cv2.imshow("Camera 0 with world axes", frame0)
+    cv2.imshow("Camera 1 with world axes", frame1)
+    cv2.waitKey(0)
 
     return R_W1, T_W1
 
 
-def save_extrinsic_calibration_parameters(R0, T0, R1, T1, prefix = ''):
-    
-    #create folder if it does not exist
-    if not os.path.exists('camera_parameters'):
-        os.mkdir('camera_parameters')
+def save_extrinsic_calibration_parameters(
+    R0: np.ndarray, T0: np.ndarray, R1: np.ndarray, T1: np.ndarray, prefix: str = ""
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Save camera extrinsic parameters to files.
 
-    camera0_rot_trans_filename = os.path.join('camera_parameters', prefix + 'camera0_rot_trans.dat')
-    outf = open(camera0_rot_trans_filename, 'w')
+    Parameters:
+        R0: Rotation matrix for camera0
+        T0: Translation vector for camera0
+        R1: Rotation matrix for camera1
+        T1: Translation vector for camera1
+        prefix: Optional prefix for output filenames
 
-    outf.write('R:\n')
-    for l in R0:
-        for en in l:
-            outf.write(str(en) + ' ')
-        outf.write('\n')
+    Returns:
+        Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]: The input parameters (R0, T0, R1, T1)
+    """
+    # Create output directory if it doesn't exist
+    if not os.path.exists("camera_parameters"):
+        os.mkdir("camera_parameters")
 
-    outf.write('T:\n')
-    for l in T0:
-        for en in l:
-            outf.write(str(en) + ' ')
-        outf.write('\n')
-    outf.close()
+    # Save camera0 parameters
+    camera0_filename = os.path.join(
+        "camera_parameters", f"{prefix}camera0_rot_trans.dat"
+    )
+    with open(camera0_filename, "w") as output_file:
+        # Write rotation matrix
+        output_file.write("R:\n")
+        for row in R0:
+            for value in row:
+                output_file.write(f"{value} ")
+            output_file.write("\n")
 
-    #R1 and T1 are just stereo calibration returned values
-    camera1_rot_trans_filename = os.path.join('camera_parameters', prefix + 'camera1_rot_trans.dat')
-    outf = open(camera1_rot_trans_filename, 'w')
+        # Write translation vector
+        output_file.write("T:\n")
+        for row in T0:
+            for value in row:
+                output_file.write(f"{value} ")
+            output_file.write("\n")
 
-    outf.write('R:\n')
-    for l in R1:
-        for en in l:
-            outf.write(str(en) + ' ')
-        outf.write('\n')
+    # Save camera1 parameters
+    camera1_filename = os.path.join(
+        "camera_parameters", f"{prefix}camera1_rot_trans.dat"
+    )
+    with open(camera1_filename, "w") as output_file:
+        # Write rotation matrix
+        output_file.write("R:\n")
+        for row in R1:
+            for value in row:
+                output_file.write(f"{value} ")
+            output_file.write("\n")
 
-    outf.write('T:\n')
-    for l in T1:
-        for en in l:
-            outf.write(str(en) + ' ')
-        outf.write('\n')
-    outf.close()
+        # Write translation vector
+        output_file.write("T:\n")
+        for row in T1:
+            for value in row:
+                output_file.write(f"{value} ")
+            output_file.write("\n")
 
     return R0, T0, R1, T1
 
-if __name__ == '__main__':
 
+if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print('Call with settings filename: "python3 calibrate.py calibration_settings.yaml"')
+        print(
+            'Call with settings filename: "python3 calibrate.py calibration_settings.yaml"'
+        )
         quit()
-    
-    #Open and parse the settings file
+
+    # Open and parse the settings file
     parse_calibration_settings_file(sys.argv[1])
 
-
     """Step1. Save calibration frames for single cameras"""
-    save_frames_single_camera('camera0') #save frames for camera0
-    save_frames_single_camera('camera1') #save frames for camera1
-
+    save_frames_single_camera("camera0")  # save frames for camera0
+    save_frames_single_camera("camera1")  # save frames for camera1
 
     """Step2. Obtain camera intrinsic matrices and save them"""
-    #camera0 intrinsics
-    images_prefix = os.path.join('frames', 'camera0*')
-    cmtx0, dist0 = calibrate_camera_for_intrinsic_parameters(images_prefix) 
-    save_camera_intrinsics(cmtx0, dist0, 'camera0') #this will write cmtx and dist to disk
-    #camera1 intrinsics
-    images_prefix = os.path.join('frames', 'camera1*')
-    cmtx1, dist1 = calibrate_camera_for_intrinsic_parameters(images_prefix)
-    save_camera_intrinsics(cmtx1, dist1, 'camera1') #this will write cmtx and dist to disk
+    # camera0 intrinsics
+    images_prefix = os.path.join("frames", "camera0*")
+    cmtx0, dist0 = calibrate_camera_for_intrinsic_parameters(images_prefix)
+    save_camera_intrinsics(cmtx0, dist0, "camera0")
 
+    # camera1 intrinsics
+    images_prefix = os.path.join("frames", "camera1*")
+    cmtx1, dist1 = calibrate_camera_for_intrinsic_parameters(images_prefix)
+    save_camera_intrinsics(cmtx1, dist1, "camera1")
 
     """Step3. Save calibration frames for both cameras simultaneously"""
-    save_frames_two_cams('camera0', 'camera1') #save simultaneous frames
-
+    save_frames_two_cams("camera0", "camera1")
 
     """Step4. Use paired calibration pattern frames to obtain camera0 to camera1 rotation and translation"""
-    frames_prefix_c0 = os.path.join('frames_pair', 'camera0*')
-    frames_prefix_c1 = os.path.join('frames_pair', 'camera1*')
-    R, T = stereo_calibrate(cmtx0, dist0, cmtx1, dist1, frames_prefix_c0, frames_prefix_c1)
-
+    frames_prefix_c0 = os.path.join("frames_pair", "camera0*")
+    frames_prefix_c1 = os.path.join("frames_pair", "camera1*")
+    R, T = stereo_calibrate(
+        cmtx0, dist0, cmtx1, dist1, frames_prefix_c0, frames_prefix_c1
+    )
 
     """Step5. Save calibration data where camera0 defines the world space origin."""
-    #camera0 rotation and translation is identity matrix and zeros vector
+    # camera0 rotation and translation is identity matrix and zeros vector
     R0 = np.eye(3, dtype=np.float32)
-    T0 = np.array([0., 0., 0.]).reshape((3, 1))
+    T0 = np.array([0.0, 0.0, 0.0]).reshape((3, 1))
 
-    save_extrinsic_calibration_parameters(R0, T0, R, T) #this will write R and T to disk
-    R1 = R; T1 = T #to avoid confusion, camera1 R and T are labeled R1 and T1
-    #check your calibration makes sense
+    # Save extrinsic parameters
+    save_extrinsic_calibration_parameters(R0, T0, R, T)
+
+    # For clarity, rename R and T for camera1
+    R1 = R
+    T1 = T
+
+    # Check calibration results by visualizing coordinate axes
     camera0_data = [cmtx0, dist0, R0, T0]
     camera1_data = [cmtx1, dist1, R1, T1]
-    check_calibration('camera0', camera0_data, 'camera1', camera1_data, _zshift = 60.)
-
+    check_calibration("camera0", camera0_data, "camera1", camera1_data, _zshift=60.0)
 
     """Optional. Define a different origin point and save the calibration data"""
-    # #get the world to camera0 rotation and translation
+    # Uncomment to define a world coordinate system based on a specific checkerboard position
+    # # Get the world to camera0 rotation and translation
     # R_W0, T_W0 = get_world_space_origin(cmtx0, dist0, os.path.join('frames_pair', 'camera0_4.png'))
-    # #get rotation and translation from world directly to camera1
-    # R_W1, T_W1 = get_cam1_to_world_transforms(cmtx0, dist0, R_W0, T_W0,
-    #                                           cmtx1, dist1, R1, T1,
-    #                                           os.path.join('frames_pair', 'camera0_4.png'),
-    #                                           os.path.join('frames_pair', 'camera1_4.png'),)
-
-    # #save rotation and translation parameters to disk
-    # save_extrinsic_calibration_parameters(R_W0, T_W0, R_W1, T_W1, prefix = 'world_to_') #this will write R and T to disk
-
+    # # Get rotation and translation from world directly to camera1
+    # R_W1, T_W1 = get_cam1_to_world_transforms(
+    #     cmtx0, dist0, R_W0, T_W0,
+    #     cmtx1, dist1, R1, T1,
+    #     os.path.join('frames_pair', 'camera0_4.png'),
+    #     os.path.join('frames_pair', 'camera1_4.png')
+    # )
+    # # Save the world-space calibration parameters
+    # save_extrinsic_calibration_parameters(R_W0, T_W0, R_W1, T_W1, prefix='world_to_')
