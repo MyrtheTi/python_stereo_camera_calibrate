@@ -10,16 +10,14 @@ TODO:
 - Implement automatic checkerboard detection parameter tuning
 - Add validation metrics for calibration quality
 - Add option for stereocamera that uses the same camera stream
-- Implement structured error handling instead of using quit()
 """
 
 import glob
 import os
-import pickle
 import sys
 import time
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import asdict, dataclass, field
+from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -49,68 +47,124 @@ class CalibrationState:
     dist_coeffs1: Optional[np.ndarray] = None
 
     # Stereo calibration results
-    rotation_matrix: Optional[np.ndarray] = None
-    translation_vector: Optional[np.ndarray] = None
+    rotation_matrix0: Optional[np.ndarray] = None
+    translation_vector0: Optional[np.ndarray] = None
+    rotation_matrix1: Optional[np.ndarray] = None
+    translation_vector1: Optional[np.ndarray] = None
+
+    # Projection matrices
+    projection_matrix0: Optional[np.ndarray] = None
+    projection_matrix1: Optional[np.ndarray] = None
 
     # Record when last modified
     last_update: str = field(default_factory=lambda: time.strftime("%Y-%m-%d %H:%M:%S"))
+
+    # Default filename for state storage
+    STATE_FILENAME: ClassVar[str] = "calibration_state.yaml"
 
     def update_timestamp(self):
         """Update the last modified timestamp."""
         self.last_update = time.strftime("%Y-%m-%d %H:%M:%S")
 
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Convert the state to a dictionary suitable for YAML serialization.
 
-def save_calibration_state(
-    state: CalibrationState, directory: str = "camera_parameters"
-) -> None:
-    """
-    Save calibration state to a file for later resumption.
+        Returns:
+            Dict[str, Any]: Dictionary representation of the calibration state
+        """
+        # Start with a standard dataclass dict conversion
+        data = asdict(self)
 
-    Parameters:
-        state: Current calibration state
-        directory: Directory to save the state file
-    """
-    if not os.path.exists(directory):
-        os.mkdir(directory)
+        # Convert numpy arrays to lists for YAML serialization
+        for key, value in data.items():
+            if isinstance(value, np.ndarray):
+                data[key] = value.tolist()
 
-    state.update_timestamp()
+        return data
 
-    filepath = os.path.join(directory, "calibration_state.pkl")
-    with open(filepath, "wb") as f:
-        pickle.dump(state, f)
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CalibrationState":
+        """
+        Create a CalibrationState instance from a dictionary.
 
-    print(f"Calibration state saved to {filepath}")
+        Parameters:
+            data: Dictionary containing calibration state data
 
+        Returns:
+            CalibrationState: A new calibration state instance
+        """
+        # Create a copy to avoid modifying the input
+        data_copy = data.copy()
 
-def load_calibration_state(
-    directory: str = "camera_parameters",
-) -> Optional[CalibrationState]:
-    """
-    Load calibration state from a file if it exists.
+        # Convert lists back to numpy arrays where needed
+        for key in [
+            "camera_matrix0",
+            "dist_coeffs0",
+            "camera_matrix1",
+            "dist_coeffs1",
+            "rotation_matrix0",
+            "rotation_matrix1",
+            "translation_vector0",
+            "translation_vector1",
+            "projection_matrix0",
+            "projection_matrix1",
+        ]:
+            if key in data_copy and data_copy[key] is not None:
+                data_copy[key] = np.array(data_copy[key])
 
-    Parameters:
-        directory: Directory where state file is located
+        return cls(**data_copy)
 
-    Returns:
-        CalibrationState object if file exists, None otherwise
-    """
-    filepath = os.path.join(directory, "calibration_state.pkl")
+    def save(self, directory: str = "camera_parameters") -> None:
+        """
+        Save calibration state to a YAML file.
 
-    if not os.path.exists(filepath):
-        return None
+        Parameters:
+            directory: Directory to save the state file
+        """
+        if not os.path.exists(directory):
+            os.makedirs(directory)
 
-    try:
-        with open(filepath, "rb") as f:
-            state = pickle.load(f)
-        print(
-            f"Loaded calibration state from {filepath} (last updated: {state.last_update})"
-        )
-        return state
-    except (pickle.UnpicklingError, EOFError):
-        print(
-            f"Error: Could not load calibration state from {filepath}. Starting fresh."
-        )
-        return None
+        self.update_timestamp()
+
+        # Convert to serializable format
+        data = self.to_dict()
+
+        # Save to YAML file
+        filepath = os.path.join(directory, self.STATE_FILENAME)
+        with open(filepath, "w") as f:
+            yaml.dump(data, f, default_flow_style=False)
+
+        print(f"Calibration state saved to {filepath}")
+
+    @classmethod
+    def load(cls, directory: str = "camera_parameters") -> Optional["CalibrationState"]:
+        """
+        Load calibration state from a YAML file if it exists.
+
+        Parameters:
+            directory: Directory where state file is located
+
+        Returns:
+            CalibrationState object if file exists, None otherwise
+        """
+        filepath = os.path.join(directory, cls.STATE_FILENAME)
+
+        if not os.path.exists(filepath):
+            return None
+
+        try:
+            with open(filepath, "r") as f:
+                data = yaml.safe_load(f)
+
+            state = cls.from_dict(data)
+            print(
+                f"Loaded calibration state from {filepath} (last updated: {state.last_update})"
+            )
+            return state
+        except (yaml.YAMLError, KeyError) as e:
+            print(f"Error: Could not load calibration state from {filepath}: {str(e)}")
+            return None
 
 
 def print_step_banner(step_number: int, step_description: str) -> None:
@@ -441,38 +495,6 @@ def calibrate_camera_for_intrinsic_parameters(
     return camera_matrix, distortion_coeffs
 
 
-def save_camera_intrinsics(
-    camera_matrix: np.ndarray, distortion_coeffs: np.ndarray, camera_name: str
-) -> None:
-    """
-    Save camera intrinsic parameters to a file.
-
-    Parameters:
-        camera_matrix: 3x3 camera intrinsic matrix
-        distortion_coeffs: Camera distortion coefficients
-        camera_name: Name of the camera (e.g., "camera0")
-
-    Returns:
-        None. Parameters are saved to 'camera_parameters/{camera_name}_intrinsics.dat'
-    """
-    # Create folder if it does not exist
-    if not os.path.exists("camera_parameters"):
-        os.mkdir("camera_parameters")
-
-    out_filename = os.path.join("camera_parameters", f"{camera_name}_intrinsics.dat")
-    with open(out_filename, "w") as output_file:
-        output_file.write("intrinsic:\n")
-        for row in camera_matrix:
-            for value in row:
-                output_file.write(f"{value} ")
-            output_file.write("\n")
-
-        output_file.write("distortion:\n")
-        for value in distortion_coeffs[0]:
-            output_file.write(f"{value} ")
-        output_file.write("\n")
-
-
 def save_frames_two_cams(camera0_name: str, camera1_name: str) -> None:
     """
     Open both cameras and capture synchronized frames for stereo calibration.
@@ -592,7 +614,9 @@ def save_frames_two_cams(camera0_name: str, camera1_name: str) -> None:
                     frame1,
                 )
                 saved_count += 1
-                print(f"Saved stereo frame pair {saved_count}/{number_to_save}")
+                print(
+                    f"Saved stereo frame pair {saved_count}/{number_to_save}", end="\r"
+                )
                 cooldown = cooldown_time
 
         cv2.imshow("Camera 0", frame0_small)
@@ -879,7 +903,7 @@ def check_calibration(
     camera1_name: str,
     camera1_data: List[np.ndarray],
     _zshift: float = 50.0,
-) -> None:
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     Visualize calibration results by projecting 3D axes onto both camera views.
 
@@ -891,7 +915,7 @@ def check_calibration(
         _zshift: Distance to shift the coordinate axes away from cameras for better visibility
 
     Returns:
-        None. Displays live video feeds with overlaid 3D axes
+        Tuple[np.ndarray, np.ndarray]: Projection matrices for both cameras
     """
     print("Verifying calibration results...")
     # Extract camera parameters from the data lists
@@ -963,7 +987,7 @@ def check_calibration(
 
         if not ret0 or not ret1:
             print("Video stream not returning frame data")
-            quit()
+            sys.exit(1)
 
         # Draw coordinate axes on camera0 view
         origin0 = tuple(pixel_points_camera0[0].astype(np.int32))
@@ -988,6 +1012,8 @@ def check_calibration(
     cap0.release()
     cap1.release()
     cv2.destroyAllWindows()
+
+    return P0, P1
 
 
 def get_world_space_origin(
@@ -1126,68 +1152,6 @@ def get_cam1_to_world_transforms(
     return R_W1, T_W1
 
 
-def save_extrinsic_calibration_parameters(
-    R0: np.ndarray, T0: np.ndarray, R1: np.ndarray, T1: np.ndarray, prefix: str = ""
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Save camera extrinsic parameters to files.
-
-    Parameters:
-        R0: Rotation matrix for camera0
-        T0: Translation vector for camera0
-        R1: Rotation matrix for camera1
-        T1: Translation vector for camera1
-        prefix: Optional prefix for output filenames
-
-    Returns:
-        Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]: The input parameters (R0, T0, R1, T1)
-    """
-    print("Saving extrinsic calibration parameters...")
-    # Create output directory if it doesn't exist
-    if not os.path.exists("camera_parameters"):
-        os.mkdir("camera_parameters")
-
-    # Save camera0 parameters
-    camera0_filename = os.path.join(
-        "camera_parameters", f"{prefix}camera0_rot_trans.dat"
-    )
-    with open(camera0_filename, "w") as output_file:
-        # Write rotation matrix
-        output_file.write("R:\n")
-        for row in R0:
-            for value in row:
-                output_file.write(f"{value} ")
-            output_file.write("\n")
-
-        # Write translation vector
-        output_file.write("T:\n")
-        for row in T0:
-            for value in row:
-                output_file.write(f"{value} ")
-            output_file.write("\n")
-
-    # Save camera1 parameters
-    camera1_filename = os.path.join(
-        "camera_parameters", f"{prefix}camera1_rot_trans.dat"
-    )
-    with open(camera1_filename, "w") as output_file:
-        # Write rotation matrix
-        output_file.write("R:\n")
-        for row in R1:
-            for value in row:
-                output_file.write(f"{value} ")
-            output_file.write("\n")
-
-        # Write translation vector
-        output_file.write("T:\n")
-        for row in T1:
-            for value in row:
-                output_file.write(f"{value} ")
-            output_file.write("\n")
-
-    return R0, T0, R1, T1
-
-
 def ask_yes_no_question(question: str) -> bool:
     """
     Ask a yes/no question to the user.
@@ -1213,13 +1177,13 @@ if __name__ == "__main__":
         print(
             'Call with settings filename: "python3 calibrate.py calibration_settings.yaml"'
         )
-        quit()
+        sys.exit(1)
 
     # Open and parse the settings file
     parse_calibration_settings_file(sys.argv[1])
 
     # Try to load existing calibration state
-    calibration_state = load_calibration_state()
+    calibration_state = CalibrationState.load()
 
     # Initialize state if none exists
     if calibration_state is None:
@@ -1253,7 +1217,7 @@ if __name__ == "__main__":
     if not calibration_state.frames_collected_cam0:
         save_frames_single_camera("camera0")
         calibration_state.frames_collected_cam0 = True
-        save_calibration_state(calibration_state)
+        calibration_state.save()
     else:
         print("Camera 0 frames already collected. Skipping.")
 
@@ -1261,13 +1225,13 @@ if __name__ == "__main__":
         if ask_yes_no_question("Do you want to recollect frames for camera0?"):
             save_frames_single_camera("camera0")
             calibration_state.frames_collected_cam0 = True
-            save_calibration_state(calibration_state)
+            calibration_state.save()
 
     # Camera 1
     if not calibration_state.frames_collected_cam1:
         save_frames_single_camera("camera1")
         calibration_state.frames_collected_cam1 = True
-        save_calibration_state(calibration_state)
+        calibration_state.save()
     else:
         print("Camera 1 frames already collected. Skipping.")
 
@@ -1275,7 +1239,7 @@ if __name__ == "__main__":
         if ask_yes_no_question("Do you want to recollect frames for camera1?"):
             save_frames_single_camera("camera1")
             calibration_state.frames_collected_cam1 = True
-            save_calibration_state(calibration_state)
+            calibration_state.save()
 
     """Step2. Obtain camera intrinsic matrices and save them"""
     print_step_banner(2, "CALIBRATE CAMERA INTRINSICS")
@@ -1286,11 +1250,10 @@ if __name__ == "__main__":
         cmtx0, dist0 = calibrate_camera_for_intrinsic_parameters(images_prefix)
 
         if cmtx0 is not None and dist0 is not None:
-            save_camera_intrinsics(cmtx0, dist0, "camera0")
             calibration_state.camera_matrix0 = cmtx0
             calibration_state.dist_coeffs0 = dist0
             calibration_state.intrinsics_calibrated_cam0 = True
-            save_calibration_state(calibration_state)
+            calibration_state.save()
     else:
         print("Camera 0 intrinsics already calibrated. Loading parameters...")
         cmtx0 = calibration_state.camera_matrix0
@@ -1302,10 +1265,10 @@ if __name__ == "__main__":
             cmtx0, dist0 = calibrate_camera_for_intrinsic_parameters(images_prefix)
 
             if cmtx0 is not None and dist0 is not None:
-                save_camera_intrinsics(cmtx0, dist0, "camera0")
                 calibration_state.camera_matrix0 = cmtx0
                 calibration_state.dist_coeffs0 = dist0
-                save_calibration_state(calibration_state)
+                calibration_state.intrinsics_calibrated_cam0 = True
+                calibration_state.save()
 
     # Camera 1 intrinsics
     if not calibration_state.intrinsics_calibrated_cam1:
@@ -1313,11 +1276,10 @@ if __name__ == "__main__":
         cmtx1, dist1 = calibrate_camera_for_intrinsic_parameters(images_prefix)
 
         if cmtx1 is not None and dist1 is not None:
-            save_camera_intrinsics(cmtx1, dist1, "camera1")
             calibration_state.camera_matrix1 = cmtx1
             calibration_state.dist_coeffs1 = dist1
             calibration_state.intrinsics_calibrated_cam1 = True
-            save_calibration_state(calibration_state)
+            calibration_state.save()
     else:
         print("Camera 1 intrinsics already calibrated. Loading parameters...")
         cmtx1 = calibration_state.camera_matrix1
@@ -1329,10 +1291,10 @@ if __name__ == "__main__":
             cmtx1, dist1 = calibrate_camera_for_intrinsic_parameters(images_prefix)
 
             if cmtx1 is not None and dist1 is not None:
-                save_camera_intrinsics(cmtx1, dist1, "camera1")
                 calibration_state.camera_matrix1 = cmtx1
                 calibration_state.dist_coeffs1 = dist1
-                save_calibration_state(calibration_state)
+                calibration_state.intrinsics_calibrated_cam1 = True
+                calibration_state.save()
 
     """Step3. Save calibration frames for both cameras simultaneously"""
     print_step_banner(3, "COLLECT SYNCHRONIZED STEREO FRAMES")
@@ -1340,7 +1302,7 @@ if __name__ == "__main__":
     if not calibration_state.stereo_frames_collected:
         save_frames_two_cams("camera0", "camera1")
         calibration_state.stereo_frames_collected = True
-        save_calibration_state(calibration_state)
+        calibration_state.save()
     else:
         print("Stereo frames already collected. Skipping.")
 
@@ -1348,7 +1310,7 @@ if __name__ == "__main__":
         if ask_yes_no_question("Do you want to recollect stereo frames?"):
             save_frames_two_cams("camera0", "camera1")
             calibration_state.stereo_frames_collected = True
-            save_calibration_state(calibration_state)
+            calibration_state.save()
 
     """Step4. Use paired calibration pattern frames to obtain camera0 to camera1 rotation and translation"""
     print_step_banner(4, "PERFORM STEREO CALIBRATION")
@@ -1356,51 +1318,57 @@ if __name__ == "__main__":
     if not calibration_state.stereo_calibrated:
         frames_prefix_c0 = os.path.join("frames_pair", "camera0*")
         frames_prefix_c1 = os.path.join("frames_pair", "camera1*")
-        R, T = stereo_calibrate(
+
+        # camera0 rotation and translation is identity matrix and zeros vector
+        R0 = np.eye(3, dtype=np.float32)
+        T0 = np.array([0.0, 0.0, 0.0]).reshape((3, 1))
+
+        R1, T1 = stereo_calibrate(
             cmtx0, dist0, cmtx1, dist1, frames_prefix_c0, frames_prefix_c1
         )
 
-        if R is not None and T is not None:
-            calibration_state.rotation_matrix = R
-            calibration_state.translation_vector = T
+        if R1 is not None and T1 is not None:
+            calibration_state.rotation_matrix0 = R0
+            calibration_state.translation_vector0 = T0
+            calibration_state.rotation_matrix1 = R1
+            calibration_state.translation_vector1 = T1
             calibration_state.stereo_calibrated = True
-            save_calibration_state(calibration_state)
+            calibration_state.save()
     else:
         print("Stereo calibration already completed. Loading parameters...")
-        R = calibration_state.rotation_matrix
-        T = calibration_state.translation_vector
+        R0 = calibration_state.rotation_matrix0
+        T0 = calibration_state.translation_vector0
+        R1 = calibration_state.rotation_matrix1
+        T1 = calibration_state.translation_vector1
 
         # Option to recalibrate if needed
         if ask_yes_no_question("Do you want to perform stereo calibration again?"):
             frames_prefix_c0 = os.path.join("frames_pair", "camera0*")
             frames_prefix_c1 = os.path.join("frames_pair", "camera1*")
-            R, T = stereo_calibrate(
+            R1, T1 = stereo_calibrate(
                 cmtx0, dist0, cmtx1, dist1, frames_prefix_c0, frames_prefix_c1
             )
 
-            if R is not None and T is not None:
-                calibration_state.rotation_matrix = R
-                calibration_state.translation_vector = T
-                save_calibration_state(calibration_state)
+            if R1 is not None and T1 is not None:
+                calibration_state.rotation_matrix1 = R1
+                calibration_state.translation_vector1 = T1
+                calibration_state.stereo_calibrated = True
+                calibration_state.save()
 
     """Step5. Save calibration data where camera0 defines the world space origin."""
     print_step_banner(5, "SAVE EXTRINSIC PARAMETERS AND VERIFY CALIBRATION")
 
-    # camera0 rotation and translation is identity matrix and zeros vector
-    R0 = np.eye(3, dtype=np.float32)
-    T0 = np.array([0.0, 0.0, 0.0]).reshape((3, 1))
-
-    # Save extrinsic parameters
-    save_extrinsic_calibration_parameters(R0, T0, R, T)
-
-    # For clarity, rename R and T for camera1
-    R1 = R
-    T1 = T
-
     # Check calibration results by visualizing coordinate axes
     camera0_data = [cmtx0, dist0, R0, T0]
     camera1_data = [cmtx1, dist1, R1, T1]
-    check_calibration("camera0", camera0_data, "camera1", camera1_data, _zshift=60.0)
+    P0, P1 = check_calibration(
+        "camera0", camera0_data, "camera1", camera1_data, _zshift=60.0
+    )
+
+    # Update calibration state with projection matrices
+    calibration_state.projection_matrix0 = P0
+    calibration_state.projection_matrix1 = P1
+    calibration_state.save()
 
     """Optional. Define a different origin point and save the calibration data"""
     print_step_banner(6, "OPTIONAL: DEFINE ALTERNATIVE WORLD ORIGIN (OPTIONAL)")
@@ -1424,10 +1392,33 @@ if __name__ == "__main__":
             os.path.join("frames_pair", "camera0_4.png"),
             os.path.join("frames_pair", "camera1_4.png"),
         )
-        # Save the world-space calibration parameters
-        save_extrinsic_calibration_parameters(
-            R_W0, T_W0, R_W1, T_W1, prefix="world_to_"
+
+        # Calculate projection matrices for world origin
+        P_W0 = get_projection_matrix(cmtx0, R_W0, T_W0)
+        P_W1 = get_projection_matrix(cmtx1, R_W1, T_W1)
+
+        # Create a special calibration state for the world origin
+        world_state = CalibrationState()
+        world_state.camera_matrix0 = cmtx0
+        world_state.dist_coeffs0 = dist0
+        world_state.camera_matrix1 = cmtx1
+        world_state.dist_coeffs1 = dist1
+        world_state.rotation_matrix0 = R_W0
+        world_state.translation_vector0 = T_W0
+        world_state.rotation_matrix1 = R_W1  # Store rotation from world to camera1
+        world_state.translation_vector1 = (
+            T_W1  # Store translation from world to camera1
         )
+        world_state.projection_matrix0 = P_W0
+        world_state.projection_matrix1 = P_W1
+        world_state.intrinsics_calibrated_cam0 = True
+        world_state.intrinsics_calibrated_cam1 = True
+        world_state.stereo_calibrated = True
+
+        # Save to a different file
+        world_state.STATE_FILENAME = "world_calibration_state.yaml"
+        world_state.save()
+
         print("Alternative world origin calibration complete and saved.")
     else:
         print("Skipping alternative world origin definition.")
