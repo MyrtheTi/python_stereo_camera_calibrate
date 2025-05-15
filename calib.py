@@ -8,163 +8,23 @@ applications using checkerboard pattern detection.
 TODO:
 - Add error handling for camera connection failures
 - Implement automatic checkerboard detection parameter tuning
-- Add validation metrics for calibration quality
 - Add option for stereocamera that uses the same camera stream
 """
 
 import glob
 import os
 import sys
-import time
-from dataclasses import asdict, dataclass, field
-from typing import Any, ClassVar, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import cv2
 import numpy as np
-import yaml
-from scipy import linalg
 
-# Dictionary to store calibration settings from YAML configuration file
-calibration_settings: Dict[str, Any] = {}
+from utils import CalibrationState, parse_calibration_settings_file
 
-
-@dataclass
-class CalibrationState:
-    """Class to track and store calibration state between sessions."""
-
-    # Step flags
-    frames_collected_cam0: bool = False
-    frames_collected_cam1: bool = False
-    intrinsics_calibrated_cam0: bool = False
-    intrinsics_calibrated_cam1: bool = False
-    stereo_frames_collected: bool = False
-    stereo_calibrated: bool = False
-
-    # Camera parameters
-    camera_matrix0: Optional[np.ndarray] = None
-    dist_coeffs0: Optional[np.ndarray] = None
-    camera_matrix1: Optional[np.ndarray] = None
-    dist_coeffs1: Optional[np.ndarray] = None
-
-    # Stereo calibration results
-    rotation_matrix0: Optional[np.ndarray] = None
-    translation_vector0: Optional[np.ndarray] = None
-    rotation_matrix1: Optional[np.ndarray] = None
-    translation_vector1: Optional[np.ndarray] = None
-
-    # Projection matrices
-    projection_matrix0: Optional[np.ndarray] = None
-    projection_matrix1: Optional[np.ndarray] = None
-
-    # Record when last modified
-    last_update: str = field(default_factory=lambda: time.strftime("%Y-%m-%d %H:%M:%S"))
-
-    # Default filename for state storage
-    STATE_FILENAME: ClassVar[str] = "calibration_state.yaml"
-
-    def update_timestamp(self):
-        """Update the last modified timestamp."""
-        self.last_update = time.strftime("%Y-%m-%d %H:%M:%S")
-
-    def to_dict(self) -> Dict[str, Any]:
-        """
-        Convert the state to a dictionary suitable for YAML serialization.
-
-        Returns:
-            Dict[str, Any]: Dictionary representation of the calibration state
-        """
-        # Start with a standard dataclass dict conversion
-        data = asdict(self)
-
-        # Convert numpy arrays to lists for YAML serialization
-        for key, value in data.items():
-            if isinstance(value, np.ndarray):
-                data[key] = value.tolist()
-
-        return data
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "CalibrationState":
-        """
-        Create a CalibrationState instance from a dictionary.
-
-        Parameters:
-            data: Dictionary containing calibration state data
-
-        Returns:
-            CalibrationState: A new calibration state instance
-        """
-        # Create a copy to avoid modifying the input
-        data_copy = data.copy()
-
-        # Convert lists back to numpy arrays where needed
-        for key in [
-            "camera_matrix0",
-            "dist_coeffs0",
-            "camera_matrix1",
-            "dist_coeffs1",
-            "rotation_matrix0",
-            "rotation_matrix1",
-            "translation_vector0",
-            "translation_vector1",
-            "projection_matrix0",
-            "projection_matrix1",
-        ]:
-            if key in data_copy and data_copy[key] is not None:
-                data_copy[key] = np.array(data_copy[key])
-
-        return cls(**data_copy)
-
-    def save(self, directory: str = "camera_parameters") -> None:
-        """
-        Save calibration state to a YAML file.
-
-        Parameters:
-            directory: Directory to save the state file
-        """
-        if not os.path.exists(directory):
-            os.makedirs(directory)
-
-        self.update_timestamp()
-
-        # Convert to serializable format
-        data = self.to_dict()
-
-        # Save to YAML file
-        filepath = os.path.join(directory, self.STATE_FILENAME)
-        with open(filepath, "w") as f:
-            yaml.dump(data, f, default_flow_style=False)
-
-        print(f"Calibration state saved to {filepath}")
-
-    @classmethod
-    def load(cls, directory: str = "camera_parameters") -> Optional["CalibrationState"]:
-        """
-        Load calibration state from a YAML file if it exists.
-
-        Parameters:
-            directory: Directory where state file is located
-
-        Returns:
-            CalibrationState object if file exists, None otherwise
-        """
-        filepath = os.path.join(directory, cls.STATE_FILENAME)
-
-        if not os.path.exists(filepath):
-            return None
-
-        try:
-            with open(filepath, "r") as f:
-                data = yaml.safe_load(f)
-
-            state = cls.from_dict(data)
-            print(
-                f"Loaded calibration state from {filepath} (last updated: {state.last_update})"
-            )
-            return state
-        except (yaml.YAMLError, KeyError) as e:
-            print(f"Error: Could not load calibration state from {filepath}: {str(e)}")
-            return None
+# Global variable to store calibration settings
+# This is initialized in main and used by all functions
+global calibration_settings
+calibration_settings: Dict[str, Any] = None
 
 
 def print_step_banner(step_number: int, step_description: str) -> None:
@@ -178,74 +38,6 @@ def print_step_banner(step_number: int, step_description: str) -> None:
     print("\n" + "=" * 80)
     print(f"STEP {step_number}: {step_description}")
     print("=" * 80 + "\n")
-
-
-def triangulate_point(
-    projection_matrix1: np.ndarray,
-    projection_matrix2: np.ndarray,
-    point1: np.ndarray,
-    point2: np.ndarray,
-) -> np.ndarray:
-    """
-    Triangulate a 3D point from two 2D projections using Direct Linear Transform (DLT).
-
-    Parameters:
-        projection_matrix1: 3x4 projection matrix of the first camera
-        projection_matrix2: 3x4 projection matrix of the second camera
-        point1: 2D point in the first camera view (x, y)
-        point2: 2D point in the second camera view (x, y)
-
-    Returns:
-        np.ndarray: 3D triangulated point (x, y, z)
-    """
-    # Create coefficient matrix for DLT
-    coefficient_matrix = [
-        point1[1] * projection_matrix1[2, :] - projection_matrix1[1, :],
-        projection_matrix1[0, :] - point1[0] * projection_matrix1[2, :],
-        point2[1] * projection_matrix2[2, :] - projection_matrix2[1, :],
-        projection_matrix2[0, :] - point2[0] * projection_matrix2[2, :],
-    ]
-    coefficient_matrix = np.array(coefficient_matrix).reshape((4, 4))
-
-    # Solve using SVD
-    btb_matrix = coefficient_matrix.transpose() @ coefficient_matrix
-    _, _, v_transpose = linalg.svd(btb_matrix, full_matrices=False)
-
-    # Extract 3D point from the last row of V transpose, normalized
-    return v_transpose[3, 0:3] / v_transpose[3, 3]
-
-
-def parse_calibration_settings_file(filename: str) -> None:
-    """
-    Parse and load calibration settings from a YAML configuration file.
-
-    Parameters:
-        filename: Path to the calibration settings YAML file
-
-    Returns:
-        None. Settings are stored in the global calibration_settings dictionary
-
-    Raises:
-        SystemExit: If file doesn't exist or doesn't contain expected format
-    """
-    global calibration_settings
-
-    if not os.path.exists(filename):
-        print("Error: File does not exist:", filename)
-        sys.exit(1)
-
-    print("Using calibration settings from:", filename)
-
-    with open(filename, "r") as config_file:
-        calibration_settings = yaml.safe_load(config_file)
-
-    # Validate that the configuration contains required settings
-    if "camera0" not in calibration_settings:
-        print(
-            "Error: 'camera0' key not found in the settings file. "
-            "Check if the correct calibration_settings.yaml file was provided."
-        )
-        sys.exit(1)
 
 
 def save_frames_single_camera(camera_name: str) -> None:
@@ -365,7 +157,7 @@ def save_frames_single_camera(camera_name: str) -> None:
 
 def calibrate_camera_for_intrinsic_parameters(
     images_prefix: str,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, float]:
     """
     Calibrate a single camera to obtain its intrinsic parameters.
 
@@ -376,9 +168,10 @@ def calibrate_camera_for_intrinsic_parameters(
         images_prefix (str): Path prefix for the calibration images (e.g., "frames/camera0*")
 
     Returns:
-        tuple: Camera matrix and distortion coefficients
+        tuple: Camera matrix, distortion coefficients, and RMSE
             - camera_matrix (numpy.ndarray): 3x3 camera intrinsic matrix
             - distortion_coeffs (numpy.ndarray): Camera distortion coefficients
+            - rmse (float): Root Mean Square Error of the calibration
     """
     print(f"Calibrating {images_prefix.split('/')[-1]} intrinsics...")
     # Find all images matching the prefix pattern
@@ -386,7 +179,7 @@ def calibrate_camera_for_intrinsic_parameters(
 
     if not image_paths:
         print(f"Error: No images found matching {images_prefix}")
-        return None, None
+        return None, None, float("inf")
 
     print(f"Found {len(image_paths)} calibration images")
 
@@ -482,7 +275,7 @@ def calibrate_camera_for_intrinsic_parameters(
 
     if not object_points:
         print("Error: No valid calibration frames detected")
-        return None, None
+        return None, None, float("inf")
 
     ret, camera_matrix, distortion_coeffs, rvecs, tvecs = cv2.calibrateCamera(
         object_points, image_points, (width, height), None, None
@@ -492,7 +285,7 @@ def calibrate_camera_for_intrinsic_parameters(
     print("Camera matrix:\n", camera_matrix)
     print("Distortion coeffs:", distortion_coeffs)
 
-    return camera_matrix, distortion_coeffs
+    return camera_matrix, distortion_coeffs, float(ret)
 
 
 def save_frames_two_cams(camera0_name: str, camera1_name: str) -> None:
@@ -648,7 +441,7 @@ def stereo_calibrate(
     dist1: np.ndarray,
     frames_prefix_c0: str,
     frames_prefix_c1: str,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, float]:
     """
     Perform stereo calibration to find transformation between two cameras.
 
@@ -664,7 +457,10 @@ def stereo_calibrate(
         frames_prefix_c1: Path prefix for the second camera's frames
 
     Returns:
-        Tuple[np.ndarray, np.ndarray]: Rotation matrix and translation vector from camera0 to camera1
+        Tuple[np.ndarray, np.ndarray, float]:
+            - Rotation matrix from camera0 to camera1
+            - Translation vector from camera0 to camera1
+            - RMSE of the stereo calibration
     """
     print("Performing stereo calibration...")
     # Read the synchronized frame pairs
@@ -673,7 +469,7 @@ def stereo_calibrate(
 
     if not c0_images_paths or not c1_images_paths:
         print("Error: No stereo image pairs found")
-        return None, None
+        return None, None, float("inf")
 
     if len(c0_images_paths) != len(c1_images_paths):
         print(
@@ -820,7 +616,7 @@ def stereo_calibrate(
 
     if used_pairs == 0:
         print("Error: No valid stereo pairs found. Cannot perform calibration.")
-        return None, None
+        return None, None, float("inf")
 
     # Perform stereo calibration, keeping intrinsics fixed
     stereocalibration_flags = cv2.CALIB_FIX_INTRINSIC
@@ -849,7 +645,7 @@ def stereo_calibrate(
 
     print("Stereo calibration complete")
     print("Stereo calibration RMSE:", ret)
-    return rotation_matrix, translation_vector
+    return rotation_matrix, translation_vector, float(ret)
 
 
 def _make_homogeneous_rep_matrix(
@@ -1180,7 +976,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # Open and parse the settings file
-    parse_calibration_settings_file(sys.argv[1])
+    calibration_settings = parse_calibration_settings_file(sys.argv[1])
 
     # Try to load existing calibration state
     calibration_state = CalibrationState.load()
@@ -1247,52 +1043,64 @@ if __name__ == "__main__":
     # Camera 0 intrinsics
     if not calibration_state.intrinsics_calibrated_cam0:
         images_prefix = os.path.join("frames", "camera0*")
-        cmtx0, dist0 = calibrate_camera_for_intrinsic_parameters(images_prefix)
+        cmtx0, dist0, rmse0 = calibrate_camera_for_intrinsic_parameters(images_prefix)
 
         if cmtx0 is not None and dist0 is not None:
             calibration_state.camera_matrix0 = cmtx0
             calibration_state.dist_coeffs0 = dist0
+            calibration_state.rmse_camera0 = rmse0
             calibration_state.intrinsics_calibrated_cam0 = True
             calibration_state.save()
     else:
         print("Camera 0 intrinsics already calibrated. Loading parameters...")
         cmtx0 = calibration_state.camera_matrix0
         dist0 = calibration_state.dist_coeffs0
+        rmse0 = calibration_state.rmse_camera0
+        print(f"Camera 0 calibration RMSE: {rmse0:.6f}")
 
         # Option to recalibrate if needed
         if ask_yes_no_question("Do you want to recalibrate camera0 intrinsics?"):
             images_prefix = os.path.join("frames", "camera0*")
-            cmtx0, dist0 = calibrate_camera_for_intrinsic_parameters(images_prefix)
+            cmtx0, dist0, rmse0 = calibrate_camera_for_intrinsic_parameters(
+                images_prefix
+            )
 
             if cmtx0 is not None and dist0 is not None:
                 calibration_state.camera_matrix0 = cmtx0
                 calibration_state.dist_coeffs0 = dist0
+                calibration_state.rmse_camera0 = rmse0
                 calibration_state.intrinsics_calibrated_cam0 = True
                 calibration_state.save()
 
     # Camera 1 intrinsics
     if not calibration_state.intrinsics_calibrated_cam1:
         images_prefix = os.path.join("frames", "camera1*")
-        cmtx1, dist1 = calibrate_camera_for_intrinsic_parameters(images_prefix)
+        cmtx1, dist1, rmse1 = calibrate_camera_for_intrinsic_parameters(images_prefix)
 
         if cmtx1 is not None and dist1 is not None:
             calibration_state.camera_matrix1 = cmtx1
             calibration_state.dist_coeffs1 = dist1
+            calibration_state.rmse_camera1 = rmse1
             calibration_state.intrinsics_calibrated_cam1 = True
             calibration_state.save()
     else:
         print("Camera 1 intrinsics already calibrated. Loading parameters...")
         cmtx1 = calibration_state.camera_matrix1
         dist1 = calibration_state.dist_coeffs1
+        rmse1 = calibration_state.rmse_camera1
+        print(f"Camera 1 calibration RMSE: {rmse1:.6f}")
 
         # Option to recalibrate if needed
         if ask_yes_no_question("Do you want to recalibrate camera1 intrinsics?"):
             images_prefix = os.path.join("frames", "camera1*")
-            cmtx1, dist1 = calibrate_camera_for_intrinsic_parameters(images_prefix)
+            cmtx1, dist1, rmse1 = calibrate_camera_for_intrinsic_parameters(
+                images_prefix
+            )
 
             if cmtx1 is not None and dist1 is not None:
                 calibration_state.camera_matrix1 = cmtx1
                 calibration_state.dist_coeffs1 = dist1
+                calibration_state.rmse_camera1 = rmse1
                 calibration_state.intrinsics_calibrated_cam1 = True
                 calibration_state.save()
 
@@ -1323,7 +1131,7 @@ if __name__ == "__main__":
         R0 = np.eye(3, dtype=np.float32)
         T0 = np.array([0.0, 0.0, 0.0]).reshape((3, 1))
 
-        R1, T1 = stereo_calibrate(
+        R1, T1, rmse_stereo = stereo_calibrate(
             cmtx0, dist0, cmtx1, dist1, frames_prefix_c0, frames_prefix_c1
         )
 
@@ -1332,6 +1140,7 @@ if __name__ == "__main__":
             calibration_state.translation_vector0 = T0
             calibration_state.rotation_matrix1 = R1
             calibration_state.translation_vector1 = T1
+            calibration_state.rmse_stereo = rmse_stereo
             calibration_state.stereo_calibrated = True
             calibration_state.save()
     else:
@@ -1340,18 +1149,21 @@ if __name__ == "__main__":
         T0 = calibration_state.translation_vector0
         R1 = calibration_state.rotation_matrix1
         T1 = calibration_state.translation_vector1
+        rmse_stereo = calibration_state.rmse_stereo
+        print(f"Stereo calibration RMSE: {rmse_stereo:.6f}")
 
         # Option to recalibrate if needed
         if ask_yes_no_question("Do you want to perform stereo calibration again?"):
             frames_prefix_c0 = os.path.join("frames_pair", "camera0*")
             frames_prefix_c1 = os.path.join("frames_pair", "camera1*")
-            R1, T1 = stereo_calibrate(
+            R1, T1, rmse_stereo = stereo_calibrate(
                 cmtx0, dist0, cmtx1, dist1, frames_prefix_c0, frames_prefix_c1
             )
 
             if R1 is not None and T1 is not None:
                 calibration_state.rotation_matrix1 = R1
                 calibration_state.translation_vector1 = T1
+                calibration_state.rmse_stereo = rmse_stereo
                 calibration_state.stereo_calibrated = True
                 calibration_state.save()
 
