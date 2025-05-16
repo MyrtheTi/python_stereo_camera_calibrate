@@ -2,7 +2,7 @@ import os
 import sys
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any, ClassVar, Dict, Optional
+from typing import Any, ClassVar, Dict, Optional, Tuple
 
 import numpy as np
 import yaml
@@ -41,6 +41,15 @@ class CalibrationState:
     # Projection matrices
     projection_matrix0: Optional[np.ndarray] = None
     projection_matrix1: Optional[np.ndarray] = None
+
+    # Rectification parameters
+    rect_R0: Optional[np.ndarray] = None
+    rect_P0: Optional[np.ndarray] = None
+    rect_R1: Optional[np.ndarray] = None
+    rect_P1: Optional[np.ndarray] = None
+    disparity_to_depth_map: Optional[np.ndarray] = None
+    roi0: Optional[Tuple[int, int, int, int]] = None
+    roi1: Optional[Tuple[int, int, int, int]] = None
 
     # Record when last modified
     last_update: str = field(default_factory=lambda: time.strftime("%Y-%m-%d %H:%M:%S"))
@@ -95,6 +104,11 @@ class CalibrationState:
             "translation_vector1",
             "projection_matrix0",
             "projection_matrix1",
+            "rect_R0",
+            "rect_P0",
+            "rect_R1",
+            "rect_P1",
+            "disparity_to_depth_map",
         ]:
             if key in data_copy and data_copy[key] is not None:
                 data_copy[key] = np.array(data_copy[key])
@@ -218,3 +232,50 @@ def triangulate_point(
 
     # Extract 3D point from the last row of V transpose, normalized
     return v_transpose[3, 0:3] / v_transpose[3, 3]
+
+
+def crop_frame(frame: np.ndarray, crop_percentage: float) -> np.ndarray:
+    """
+    Crop a camera frame to remove the edges.
+
+    Parameters:
+        frame: Original camera frame
+        crop_percentage: Percentage of the frame to crop from each edge
+
+    Returns:
+        Cropped frame
+    """
+    if crop_percentage <= 0:
+        return frame
+
+    height, width = frame.shape[:2]
+    crop_pixels_h = int(height * crop_percentage / 100)
+    crop_pixels_w = int(width * crop_percentage / 100)
+
+    # Crop the frame from all sides
+    cropped = frame[
+        crop_pixels_h : height - crop_pixels_h, crop_pixels_w : width - crop_pixels_w
+    ]
+    return cropped
+
+
+def split_stereo_frame(frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Split a side-by-side stereo frame into left and right camera views.
+
+    Parameters:
+        frame: Input stereo frame containing both left and right views
+
+    Returns:
+        Tuple containing left frame and right frame
+    """
+    height, width = frame.shape[:2]
+
+    # Split the frame exactly in the middle
+    mid_point = width // 2
+
+    # Extract left and right portions
+    left_frame = frame[:, :mid_point].copy()
+    right_frame = frame[:, mid_point:].copy()
+
+    return left_frame, right_frame

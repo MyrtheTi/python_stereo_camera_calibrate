@@ -4,11 +4,6 @@ Stereo Camera Calibration
 This script provides functionality for calibrating stereo camera systems.
 It handles intrinsic and extrinsic parameter calibration for stereo vision
 applications using checkerboard pattern detection.
-
-TODO:
-- Add error handling for camera connection failures
-- Implement automatic checkerboard detection parameter tuning
-- Add option for stereocamera that uses the same camera stream
 """
 
 import glob
@@ -19,11 +14,14 @@ from typing import Any, Dict, List, Tuple
 import cv2
 import numpy as np
 
-from utils import CalibrationState, parse_calibration_settings_file
+from utils import (
+    CalibrationState,
+    crop_frame,
+    parse_calibration_settings_file,
+    split_stereo_frame,
+)
 
 # Global variable to store calibration settings
-# This is initialized in main and used by all functions
-global calibration_settings
 calibration_settings: Dict[str, Any] = None
 
 
@@ -58,6 +56,17 @@ def save_frames_single_camera(camera_name: str) -> None:
     if not os.path.exists("frames"):
         os.mkdir("frames")
 
+    # Check if we're in single camera stereo mode
+    use_single_camera = calibration_settings.get("use_single_camera_for_stereo", False)
+
+    # If we're in single camera stereo mode and this is camera1, we can skip
+    # as we'll capture both frames when processing camera0
+    if use_single_camera and camera_name == "camera1":
+        print(
+            "Using single camera for stereo - camera1 frames will be captured with camera0"
+        )
+        return
+
     # Get settings from configuration
     camera_device_id = calibration_settings[camera_name]
     width = calibration_settings["frame_width"]
@@ -65,12 +74,29 @@ def save_frames_single_camera(camera_name: str) -> None:
     number_to_save = calibration_settings["mono_calibration_frames"]
     view_resize = calibration_settings["view_resize"]
     cooldown_time = calibration_settings["cooldown"]
+    crop_percentage = calibration_settings.get("crop_percentage", 0)
+
+    if crop_percentage > 0:
+        print(f"Camera {camera_name} will be cropped by {crop_percentage}%")
+
+    if use_single_camera:
+        print(f"Using single camera stereo mode with device ID: {camera_device_id}")
+        # Create frames directory for pairs if it doesn't exist
+        if not os.path.exists("frames_pair"):
+            os.mkdir("frames_pair")
 
     # Open video stream and set resolution
     # Note: If unsupported resolution is used, this does NOT raise an error
     cap = cv2.VideoCapture(camera_device_id)
-    cap.set(3, width)
-    cap.set(4, height)
+
+    # If using single camera mode, we need to double the width
+    if use_single_camera:
+        # Set resolution to double width for side-by-side stereo
+        cap.set(3, width * 2)
+        cap.set(4, height)
+    else:
+        cap.set(3, width)
+        cap.set(4, height)
 
     # Check if camera opened successfully
     if not cap.isOpened():
@@ -90,6 +116,20 @@ def save_frames_single_camera(camera_name: str) -> None:
             cap.release()
             return
 
+        # If we're in single camera stereo mode, split the frame
+        if use_single_camera:
+            left_frame, right_frame = split_stereo_frame(frame)
+
+            # Use appropriate half based on which camera we're collecting for
+            if camera_name == "camera0":
+                frame = left_frame
+
+        # Apply cropping if needed
+        if crop_percentage > 0:
+            frame = crop_frame(frame, crop_percentage)
+            if use_single_camera:
+                right_frame = crop_frame(right_frame, crop_percentage)
+
         # Create a smaller version of the frame for display
         frame_small = cv2.resize(frame, None, fx=1 / view_resize, fy=1 / view_resize)
 
@@ -99,7 +139,7 @@ def save_frames_single_camera(camera_name: str) -> None:
                 "Press SPACEBAR to start collection frames",
                 (50, 50),
                 cv2.FONT_HERSHEY_COMPLEX,
-                1,
+                0.7,
                 (0, 0, 255),
                 1,
             )
@@ -111,7 +151,7 @@ def save_frames_single_camera(camera_name: str) -> None:
                 f"Cooldown: {cooldown}",
                 (50, 50),
                 cv2.FONT_HERSHEY_COMPLEX,
-                1,
+                0.7,
                 (0, 255, 0),
                 1,
             )
@@ -120,7 +160,7 @@ def save_frames_single_camera(camera_name: str) -> None:
                 f"Num frames: {saved_count}/{number_to_save}",
                 (50, 100),
                 cv2.FONT_HERSHEY_COMPLEX,
-                1,
+                0.7,
                 (0, 255, 0),
                 1,
             )
@@ -129,14 +169,42 @@ def save_frames_single_camera(camera_name: str) -> None:
             if cooldown <= 0:
                 save_path = os.path.join("frames", f"{camera_name}_{saved_count}.png")
                 cv2.imwrite(save_path, frame)
+
+                # If we're using single camera mode and this is camera0,
+                # we should also save camera1 at the same time
+                if use_single_camera and camera_name == "camera0":
+                    cam1_path = os.path.join("frames", f"camera1_{saved_count}.png")
+                    cv2.imwrite(cam1_path, right_frame)
+                    cv2.imwrite(
+                        os.path.join("frames_pair", f"camera0_{saved_count}.png"),
+                        frame,
+                    )
+                    cv2.imwrite(
+                        os.path.join("frames_pair", f"camera1_{saved_count}.png"),
+                        right_frame,
+                    )
+                    print(
+                        f"Saved both camera0 and camera1 frames {saved_count}/{number_to_save}",
+                        end="\r",
+                    )
+                else:
+                    print(
+                        f"Saved frame {saved_count}/{number_to_save} for {camera_name}",
+                        end="\r",
+                    )
+
                 saved_count += 1
-                print(
-                    f"Saved frame {saved_count}/{number_to_save} for {camera_name}",
-                    end="\r",
-                )
                 cooldown = cooldown_time
 
-        cv2.imshow("frame_small", frame_small)
+        cv2.imshow(f"{camera_name} frame", frame_small)
+
+        # If we're using single camera mode, also show the other half
+        if use_single_camera and camera_name == "camera0":
+            other_frame = cv2.resize(
+                right_frame, None, fx=1 / view_resize, fy=1 / view_resize
+            )
+            cv2.imshow("camera1 (from stereo)", other_frame)
+
         key = cv2.waitKey(1)
 
         if key == 27:  # ESC key
@@ -149,6 +217,14 @@ def save_frames_single_camera(camera_name: str) -> None:
         # Break out of the loop when enough frames have been saved
         if saved_count == number_to_save:
             print(f"Completed collecting {number_to_save} frames for {camera_name}")
+
+            # If we're in single camera mode and this is camera0,
+            # we've also collected camera1 frames
+            if use_single_camera and camera_name == "camera0":
+                print(
+                    f"Also collected {number_to_save} frames for camera1 from the same source"
+                )
+
             break
 
     cap.release()
@@ -282,9 +358,6 @@ def calibrate_camera_for_intrinsic_parameters(
     )
     print("Camera calibration complete")
     print("RMSE:", ret)
-    print("Camera matrix:\n", camera_matrix)
-    print("Distortion coeffs:", distortion_coeffs)
-
     return camera_matrix, distortion_coeffs, float(ret)
 
 
@@ -311,39 +384,84 @@ def save_frames_two_cams(camera0_name: str, camera1_name: str) -> None:
     view_resize = calibration_settings["view_resize"]
     cooldown_time = calibration_settings["cooldown"]
     number_to_save = calibration_settings["stereo_calibration_frames"]
+    crop_percentage = calibration_settings.get("crop_percentage", 0)
 
-    # Open video streams for both cameras
-    cap0 = cv2.VideoCapture(calibration_settings[camera0_name])
-    cap1 = cv2.VideoCapture(calibration_settings[camera1_name])
+    # Check if using single camera mode for stereo
+    use_single_camera = calibration_settings.get("use_single_camera_for_stereo", False)
 
-    # Check if cameras opened successfully
-    if not cap0.isOpened() or not cap1.isOpened():
-        print("Error: Could not open one or both cameras")
-        if cap0.isOpened():
-            cap0.release()
-        if cap1.isOpened():
-            cap1.release()
-        return
+    if crop_percentage > 0:
+        print(f"Cameras will be cropped by {crop_percentage}%")
 
-    # Set camera resolutions
+    # Setup camera capture
     width = calibration_settings["frame_width"]
     height = calibration_settings["frame_height"]
-    cap0.set(3, width)
-    cap0.set(4, height)
-    cap1.set(3, width)
-    cap1.set(4, height)
+
+    if use_single_camera:
+        camera_device_id = calibration_settings[camera0_name]
+
+        # In single camera mode, we only need one camera
+        print(f"Using single camera stereo mode with device ID: {camera_device_id}")
+
+        # Open single video stream
+        cap = cv2.VideoCapture(camera_device_id)
+
+        # Set resolution to double width for side-by-side stereo
+        cap.set(3, width * 2)  # Double width for side-by-side stereo
+        cap.set(4, height)
+
+        # Check if camera opened successfully
+        if not cap.isOpened():
+            print(
+                f"Error: Could not open stereo camera (device ID: {camera_device_id})"
+            )
+            return
+
+    else:
+        # Open video streams for both cameras
+        cap0 = cv2.VideoCapture(calibration_settings[camera0_name])
+        cap1 = cv2.VideoCapture(calibration_settings[camera1_name])
+
+        # Check if cameras opened successfully
+        if not cap0.isOpened() or not cap1.isOpened():
+            print("Error: Could not open one or both cameras")
+            if cap0.isOpened():
+                cap0.release()
+            if cap1.isOpened():
+                cap1.release()
+            return
+
+        # Set camera resolutions
+        cap0.set(3, width)
+        cap0.set(4, height)
+        cap1.set(3, width)
+        cap1.set(4, height)
 
     cooldown = cooldown_time
     start = False
     saved_count = 0
 
     while True:
-        ret0, frame0 = cap0.read()
-        ret1, frame1 = cap1.read()
+        # Get frames based on whether we're using single or dual camera mode
+        if use_single_camera:
+            ret, frame = cap.read()
+            if not ret:
+                print("Stereo camera not returning video data. Exiting...")
+                break
 
-        if not ret0 or not ret1:
-            print("Cameras not returning video data. Exiting...")
-            break
+            # Split the combined frame into left and right
+            frame0, frame1 = split_stereo_frame(frame)
+        else:
+            ret0, frame0 = cap0.read()
+            ret1, frame1 = cap1.read()
+
+            if not ret0 or not ret1:
+                print("Cameras not returning video data. Exiting...")
+                break
+
+        # Apply fisheye cropping if needed
+        if crop_percentage > 0:
+            frame0 = crop_frame(frame0, crop_percentage)
+            frame1 = crop_frame(frame1, crop_percentage)
 
         # Create smaller versions of frames for display
         frame0_small = cv2.resize(
@@ -359,7 +477,7 @@ def save_frames_two_cams(camera0_name: str, camera1_name: str) -> None:
                 "Make sure both cameras can see the calibration pattern well",
                 (50, 50),
                 cv2.FONT_HERSHEY_COMPLEX,
-                1,
+                0.7,
                 (0, 0, 255),
                 1,
             )
@@ -368,7 +486,7 @@ def save_frames_two_cams(camera0_name: str, camera1_name: str) -> None:
                 "Press SPACEBAR to start collection frames",
                 (50, 100),
                 cv2.FONT_HERSHEY_COMPLEX,
-                1,
+                0.7,
                 (0, 0, 255),
                 1,
             )
@@ -382,7 +500,7 @@ def save_frames_two_cams(camera0_name: str, camera1_name: str) -> None:
                     f"Cooldown: {cooldown}",
                     (50, 50),
                     cv2.FONT_HERSHEY_COMPLEX,
-                    1,
+                    0.7,
                     (0, 255, 0),
                     1,
                 )
@@ -391,7 +509,7 @@ def save_frames_two_cams(camera0_name: str, camera1_name: str) -> None:
                     f"Num frames: {saved_count}/{number_to_save}",
                     (50, 100),
                     cv2.FONT_HERSHEY_COMPLEX,
-                    1,
+                    0.7,
                     (0, 255, 0),
                     1,
                 )
@@ -429,8 +547,13 @@ def save_frames_two_cams(camera0_name: str, camera1_name: str) -> None:
             print(f"Completed collecting {number_to_save} stereo frame pairs")
             break
 
-    cap0.release()
-    cap1.release()
+    # Close camera(s)
+    if use_single_camera:
+        cap.release()
+    else:
+        cap0.release()
+        cap1.release()
+
     cv2.destroyAllWindows()
 
 
@@ -762,51 +885,108 @@ def check_calibration(
     pixel_points_camera0 = np.array(pixel_points_camera0)
     pixel_points_camera1 = np.array(pixel_points_camera1)
 
-    # Open video streams
     cap0 = cv2.VideoCapture(calibration_settings[camera0_name])
-    cap1 = cv2.VideoCapture(calibration_settings[camera1_name])
 
-    # Set camera resolutions
     width = calibration_settings["frame_width"]
     height = calibration_settings["frame_height"]
-    cap0.set(3, width)
-    cap0.set(4, height)
-    cap1.set(3, width)
-    cap1.set(4, height)
+    crop_percentage = calibration_settings.get("crop_percentage", 0)
 
-    # Use RGB colors to represent XYZ axes
-    colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]  # Red, Green, Blue for X, Y, Z
+    # Check if using single camera mode
+    use_single_camera = calibration_settings.get("use_single_camera_for_stereo", False)
 
-    while True:
-        ret0, frame0 = cap0.read()
-        ret1, frame1 = cap1.read()
+    if use_single_camera:
+        # Set resolution to double width for side-by-side stereo
+        cap0.set(3, width * 2)
+        cap0.set(4, height)
 
-        if not ret0 or not ret1:
-            print("Video stream not returning frame data")
+        if not cap0.isOpened():
+            print(
+                f"Error: Could not open stereo camera (device ID: {calibration_settings[camera0_name]})"
+            )
             sys.exit(1)
 
-        # Draw coordinate axes on camera0 view
-        origin0 = tuple(pixel_points_camera0[0].astype(np.int32))
-        for color, point in zip(colors, pixel_points_camera0[1:]):
-            point_pixel = tuple(point.astype(np.int32))
-            cv2.line(frame0, origin0, point_pixel, color, 2)
+        # Use RGB colors to represent XYZ axes
+        colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]  # Red, Green, Blue for X, Y, Z
 
-        # Draw coordinate axes on camera1 view
-        origin1 = tuple(pixel_points_camera1[0].astype(np.int32))
-        for color, point in zip(colors, pixel_points_camera1[1:]):
-            point_pixel = tuple(point.astype(np.int32))
-            cv2.line(frame1, origin1, point_pixel, color, 2)
+        while True:
+            ret, frame = cap0.read()
+            if not ret:
+                print("Video stream not returning frame data")
+                sys.exit(1)
 
-        # Display the frames with projected axes
-        cv2.imshow("Camera 0", frame0)
-        cv2.imshow("Camera 1", frame1)
+            # Split the frame into left and right
+            frame0, frame1 = split_stereo_frame(frame)
+            if crop_percentage > 0:
+                frame0 = crop_frame(frame0, crop_percentage)
+                frame1 = crop_frame(frame1, crop_percentage)
 
-        key = cv2.waitKey(1)
-        if key == 27:  # ESC key
-            break
+            # Draw coordinate axes on camera0 view
+            origin0 = tuple(pixel_points_camera0[0].astype(np.int32))
+            for color, point in zip(colors, pixel_points_camera0[1:]):
+                point_pixel = tuple(point.astype(np.int32))
+                cv2.line(frame0, origin0, point_pixel, color, 2)
 
-    cap0.release()
-    cap1.release()
+            # Draw coordinate axes on camera1 view
+            origin1 = tuple(pixel_points_camera1[0].astype(np.int32))
+            for color, point in zip(colors, pixel_points_camera1[1:]):
+                point_pixel = tuple(point.astype(np.int32))
+                cv2.line(frame1, origin1, point_pixel, color, 2)
+
+            # Display the frames with projected axes
+            cv2.imshow("Camera 0", frame0)
+            cv2.imshow("Camera 1", frame1)
+
+            key = cv2.waitKey(1)
+            if key == 27:  # ESC key
+                break
+
+        cap0.release()
+    else:
+        # Open video streams
+        cap1 = cv2.VideoCapture(calibration_settings[camera1_name])
+
+        # Set camera resolutions
+        width = calibration_settings["frame_width"]
+        height = calibration_settings["frame_height"]
+        cap0.set(3, width)
+        cap0.set(4, height)
+        cap1.set(3, width)
+        cap1.set(4, height)
+
+        # Use RGB colors to represent XYZ axes
+        colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]  # Red, Green, Blue for X, Y, Z
+
+        while True:
+            ret0, frame0 = cap0.read()
+            ret1, frame1 = cap1.read()
+
+            if not ret0 or not ret1:
+                print("Video stream not returning frame data")
+                sys.exit(1)
+
+            # Draw coordinate axes on camera0 view
+            origin0 = tuple(pixel_points_camera0[0].astype(np.int32))
+            for color, point in zip(colors, pixel_points_camera0[1:]):
+                point_pixel = tuple(point.astype(np.int32))
+                cv2.line(frame0, origin0, point_pixel, color, 2)
+
+            # Draw coordinate axes on camera1 view
+            origin1 = tuple(pixel_points_camera1[0].astype(np.int32))
+            for color, point in zip(colors, pixel_points_camera1[1:]):
+                point_pixel = tuple(point.astype(np.int32))
+                cv2.line(frame1, origin1, point_pixel, color, 2)
+
+            # Display the frames with projected axes
+            cv2.imshow("Camera 0", frame0)
+            cv2.imshow("Camera 1", frame1)
+
+            key = cv2.waitKey(1)
+            if key == 27:  # ESC key
+                break
+
+        cap0.release()
+        cap1.release()
+
     cv2.destroyAllWindows()
 
     return P0, P1
@@ -968,6 +1148,417 @@ def ask_yes_no_question(question: str) -> bool:
             print("Please answer with 'y' or 'n'")
 
 
+def rectify_stereo_fisheye(
+    camera_matrix0: np.ndarray,
+    dist_coeffs0: np.ndarray,
+    camera_matrix1: np.ndarray,
+    dist_coeffs1: np.ndarray,
+    rotation_matrix: np.ndarray,
+    translation_vector: np.ndarray,
+    image_size: Tuple[int, int],
+) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+    """
+    Perform stereo rectification for fisheye cameras.
+
+    Parameters:
+        camera_matrix0: Intrinsic matrix of the first camera
+        dist_coeffs0: Distortion coefficients of the first camera
+        camera_matrix1: Intrinsic matrix of the second camera
+        dist_coeffs1: Distortion coefficients of the second camera
+        rotation_matrix: Rotation matrix from camera0 to camera1
+        translation_vector: Translation vector from camera0 to camera1
+        image_size: Size of the image (width, height)
+
+    Returns:
+        Tuple containing:
+        - Dictionary with rectification parameters for camera0
+        - Dictionary with rectification parameters for camera1
+    """
+    print("Performing stereo rectification for fisheye cameras...")
+
+    # Convert distortion coefficients format for fisheye model
+    # OpenCV fisheye model expects 4 parameters: k1, k2, k3, k4
+    if dist_coeffs0.shape[1] > 4:
+        dist_coeffs0 = dist_coeffs0[:, :4]
+    if dist_coeffs1.shape[1] > 4:
+        dist_coeffs1 = dist_coeffs1[:, :4]
+
+    # Get rectification transforms and projection matrices
+    flags = (
+        cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC
+        + cv2.fisheye.CALIB_CHECK_COND
+        + cv2.fisheye.CALIB_FIX_SKEW
+    )
+
+    # Determine the free scaling parameter
+    balance = 0.0
+    if "fisheye_balance_parameter" in calibration_settings:
+        balance = calibration_settings["fisheye_balance_parameter"]
+
+    # Determine the FOV for the rectified images
+    fov_scale = 1.0
+    if "fisheye_fov_scale" in calibration_settings:
+        fov_scale = calibration_settings["fisheye_fov_scale"]
+
+    # Perform stereo rectification
+    R0, R1, P0, P1, Q = cv2.fisheye.stereoRectify(
+        camera_matrix0,
+        dist_coeffs0,
+        camera_matrix1,
+        dist_coeffs1,
+        image_size,
+        rotation_matrix,
+        translation_vector,
+        flags,
+        (0, 0),
+        (0, 0),
+        None,
+        balance=balance,
+        fov_scale=fov_scale,
+    )
+
+    # Initialize undistortion and rectification maps
+    map0_x, map0_y = cv2.fisheye.initUndistortRectifyMap(
+        camera_matrix0, dist_coeffs0, R0, P0, image_size, cv2.CV_32FC1
+    )
+    map1_x, map1_y = cv2.fisheye.initUndistortRectifyMap(
+        camera_matrix1, dist_coeffs1, R1, P1, image_size, cv2.CV_32FC1
+    )
+
+    # Create dictionaries to store all parameters
+    camera0_rect = {"R": R0, "P": P0, "map_x": map0_x, "map_y": map0_y}
+
+    camera1_rect = {"R": R1, "P": P1, "map_x": map1_x, "map_y": map1_y}
+
+    # Store disparity-to-depth mapping matrix
+    disparity_to_depth = Q
+
+    # Update CalibrationState
+    if calibration_state is not None:
+        calibration_state.rect_R0 = R0
+        calibration_state.rect_P0 = P0
+        calibration_state.rect_R1 = R1
+        calibration_state.rect_P1 = P1
+        calibration_state.disparity_to_depth_map = Q
+        calibration_state.save()
+
+    print("Rectification maps created successfully")
+    return camera0_rect, camera1_rect
+
+
+def rectify_stereo_standard(
+    camera_matrix0: np.ndarray,
+    dist_coeffs0: np.ndarray,
+    camera_matrix1: np.ndarray,
+    dist_coeffs1: np.ndarray,
+    rotation_matrix: np.ndarray,
+    translation_vector: np.ndarray,
+    image_size: Tuple[int, int],
+) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+    """
+    Perform stereo rectification for standard (non-fisheye) cameras.
+
+    Parameters:
+        camera_matrix0: Intrinsic matrix of the first camera
+        dist_coeffs0: Distortion coefficients of the first camera
+        camera_matrix1: Intrinsic matrix of the second camera
+        dist_coeffs1: Distortion coefficients of the second camera
+        rotation_matrix: Rotation matrix from camera0 to camera1
+        translation_vector: Translation vector from camera0 to camera1
+        image_size: Size of the image (width, height)
+
+    Returns:
+        Tuple containing:
+        - Dictionary with rectification parameters for camera0
+        - Dictionary with rectification parameters for camera1
+    """
+    print("Performing stereo rectification for standard cameras...")
+
+    alpha = calibration_settings.get("rectification_alpha", -1)
+
+    # Perform stereo rectification
+    R0, R1, P0, P1, Q, roi0, roi1 = cv2.stereoRectify(
+        camera_matrix0,
+        dist_coeffs0,
+        camera_matrix1,
+        dist_coeffs1,
+        image_size,
+        rotation_matrix,
+        translation_vector,
+        None,
+        None,
+        None,
+        None,
+        None,
+        cv2.CALIB_ZERO_DISPARITY,
+        alpha,
+    )
+
+    # Initialize undistortion and rectification maps
+    map0_x, map0_y = cv2.initUndistortRectifyMap(
+        camera_matrix0, dist_coeffs0, R0, P0, image_size, cv2.CV_32FC1
+    )
+    map1_x, map1_y = cv2.initUndistortRectifyMap(
+        camera_matrix1, dist_coeffs1, R1, P1, image_size, cv2.CV_32FC1
+    )
+
+    # Create dictionaries to store all parameters
+    camera0_rect = {"R": R0, "P": P0, "map_x": map0_x, "map_y": map0_y, "roi": roi0}
+
+    camera1_rect = {"R": R1, "P": P1, "map_x": map1_x, "map_y": map1_y, "roi": roi1}
+
+    # Update CalibrationState
+    if calibration_state is not None:
+        calibration_state.rect_R0 = R0
+        calibration_state.rect_P0 = P0
+        calibration_state.rect_R1 = R1
+        calibration_state.rect_P1 = P1
+        calibration_state.disparity_to_depth_map = Q
+        calibration_state.roi0 = roi0
+        calibration_state.roi1 = roi1
+        calibration_state.save()
+
+    print("Rectification maps created successfully")
+    print(f"Valid ROI for camera0: {roi0}")
+    print(f"Valid ROI for camera1: {roi1}")
+
+    return camera0_rect, camera1_rect
+
+
+def create_rectification_maps(
+    cmtx0: np.ndarray,
+    dist0: np.ndarray,
+    cmtx1: np.ndarray,
+    dist1: np.ndarray,
+    R: np.ndarray,
+    T: np.ndarray,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+    """
+    Create rectification maps based on calibration parameters.
+
+    Parameters:
+        cmtx0: Intrinsic matrix of camera0
+        dist0: Distortion coefficients of camera0
+        cmtx1: Intrinsic matrix of camera1
+        dist1: Distortion coefficients of camera1
+        R: Rotation matrix from camera0 to camera1
+        T: Translation vector from camera0 to camera1
+
+    Returns:
+        Tuple containing rectification parameters for both cameras
+    """
+    # Get image dimensions from calibration settings
+    width = calibration_settings["frame_width"]
+    height = calibration_settings["frame_height"]
+
+    # Check for cropping and adjust dimensions if needed
+    crop_percentage = calibration_settings.get("crop_percentage", 0)
+
+    # Calculate adjusted dimensions if cropping is applied
+    if crop_percentage > 0:
+        crop_pixels_h = int(height * crop_percentage / 100)
+        crop_pixels_w = int(width * crop_percentage / 100)
+        adjusted_width = width - 2 * crop_pixels_w
+        adjusted_height = height - 2 * crop_pixels_h
+        image_size = (adjusted_width, adjusted_height)
+        print(
+            f"Using adjusted dimensions for rectification: {image_size} (with {crop_percentage}% crop)"
+        )
+    else:
+        image_size = (width, height)
+        print(f"Using original dimensions for rectification: {image_size}")
+
+    # Check camera fisheye setting
+    is_fisheye = calibration_settings.get("is_fisheye", False)
+
+    if is_fisheye:  # Both cameras are fisheye
+        print("Both cameras are fisheye - using fisheye rectification")
+        return rectify_stereo_fisheye(cmtx0, dist0, cmtx1, dist1, R, T, image_size)
+    else:  # Both cameras are standard
+        print("Both cameras are standard - using standard rectification")
+        return rectify_stereo_standard(cmtx0, dist0, cmtx1, dist1, R, T, image_size)
+
+
+def verify_rectification(
+    camera0_rect: Dict[str, np.ndarray],
+    camera1_rect: Dict[str, np.ndarray],
+    camera0_name: str,
+    camera1_name: str,
+) -> None:
+    """
+    Verify rectification by showing rectified video from both cameras.
+
+    Parameters:
+        camera0_rect: Rectification parameters for camera0
+        camera1_rect: Rectification parameters for camera1
+        camera0_name: Name of camera0 in settings
+        camera1_name: Name of camera1 in settings
+    """
+    print("Opening cameras to verify rectification...")
+
+    # Check if using single camera mode
+    use_single_camera = calibration_settings.get("use_single_camera_for_stereo", False)
+
+    # Set camera resolutions
+    width = calibration_settings["frame_width"]
+    height = calibration_settings["frame_height"]
+    crop_percentage = calibration_settings.get("crop_percentage", 0)
+
+    if use_single_camera:
+        # Open single video stream
+        cap = cv2.VideoCapture(calibration_settings[camera0_name])
+
+        # Set resolution to double width for side-by-side stereo
+        cap.set(3, width * 2)
+        cap.set(4, height)
+
+        # Check if camera opened successfully
+        if not cap.isOpened():
+            print(
+                f"Error: Could not open stereo camera (device ID: {calibration_settings[camera0_name]})"
+            )
+            return
+    else:
+        # Open video streams
+        cap0 = cv2.VideoCapture(calibration_settings[camera0_name])
+        cap1 = cv2.VideoCapture(calibration_settings[camera1_name])
+
+        # Set camera resolutions
+        cap0.set(3, width)
+        cap0.set(4, height)
+        cap1.set(3, width)
+        cap1.set(4, height)
+
+        # Check if cameras opened successfully
+        if not cap0.isOpened() or not cap1.isOpened():
+            print("Error: Could not open one or both cameras")
+            if cap0.isOpened():
+                cap0.release()
+            if cap1.isOpened():
+                cap1.release()
+            return
+
+    # Extract rectification maps
+    map0_x = camera0_rect["map_x"]
+    map0_y = camera0_rect["map_y"]
+    map1_x = camera1_rect["map_x"]
+    map1_y = camera1_rect["map_y"]
+
+    # ROI for cropping (may be None for fisheye)
+    roi0 = camera0_rect.get("roi", None)
+    roi1 = camera1_rect.get("roi", None)
+
+    print("Displaying rectified frames. Press ESC to exit.")
+
+    while True:
+        if use_single_camera:
+            ret, frame = cap.read()
+            if not ret:
+                print("Error reading from stereo camera")
+                break
+
+            # Split the combined frame into left and right
+            frame0, frame1 = split_stereo_frame(frame)
+        else:
+            ret0, frame0 = cap0.read()
+            ret1, frame1 = cap1.read()
+
+            if not ret0 or not ret1:
+                print("Error reading from cameras")
+                break
+
+        if crop_percentage > 0:
+            frame0 = crop_frame(frame0, crop_percentage)
+            frame1 = crop_frame(frame1, crop_percentage)
+
+        # Rectify images
+        frame0_rectified = cv2.remap(frame0, map0_x, map0_y, cv2.INTER_LINEAR)
+        frame1_rectified = cv2.remap(frame1, map1_x, map1_y, cv2.INTER_LINEAR)
+
+        # Crop to ROI if available
+        if roi0 is not None:
+            x, y, w, h = roi0
+            if w > 0 and h > 0:
+                frame0_rectified = frame0_rectified[y : y + h, x : x + w]
+
+        if roi1 is not None:
+            x, y, w, h = roi1
+            if w > 0 and h > 0:
+                frame1_rectified = frame1_rectified[y : y + h, x : x + w]
+
+        # Draw horizontal lines to check rectification
+        for i in range(0, height, 50):
+            cv2.line(frame0_rectified, (0, i), (width, i), (0, 255, 0), 1)
+            cv2.line(frame1_rectified, (0, i), (width, i), (0, 255, 0), 1)
+
+        cv2.imshow("left", frame0_rectified)
+        cv2.imshow("right", frame1_rectified)
+
+        key = cv2.waitKey(1)
+        if key == 27:  # ESC key
+            break
+
+    # Close camera(s)
+    if use_single_camera:
+        cap.release()
+    else:
+        cap0.release()
+        cap1.release()
+
+    cv2.destroyAllWindows()
+
+
+def save_rectification_maps(
+    camera0_rect: Dict[str, np.ndarray],
+    camera1_rect: Dict[str, np.ndarray],
+    directory: str = "camera_parameters",
+) -> None:
+    """
+    Save rectification maps and parameters to files for later use.
+
+    Parameters:
+        camera0_rect: Rectification data for camera0
+        camera1_rect: Rectification data for camera1
+        directory: Directory to save the parameters
+    """
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+
+    # Save rectification data using numpy's save function
+    np.save(os.path.join(directory, "camera0_mapx.npy"), camera0_rect["map_x"])
+    np.save(os.path.join(directory, "camera0_mapy.npy"), camera0_rect["map_y"])
+    np.save(os.path.join(directory, "camera0_rect_R.npy"), camera0_rect["R"])
+    np.save(os.path.join(directory, "camera0_rect_P.npy"), camera0_rect["P"])
+
+    np.save(os.path.join(directory, "camera1_mapx.npy"), camera1_rect["map_x"])
+    np.save(os.path.join(directory, "camera1_mapy.npy"), camera1_rect["map_y"])
+    np.save(os.path.join(directory, "camera1_rect_R.npy"), camera1_rect["R"])
+    np.save(os.path.join(directory, "camera1_rect_P.npy"), camera1_rect["P"])
+
+    # Save ROI if available
+    if "roi" in camera0_rect:
+        np.save(os.path.join(directory, "camera0_roi.npy"), camera0_rect["roi"])
+    if "roi" in camera1_rect:
+        np.save(os.path.join(directory, "camera1_roi.npy"), camera1_rect["roi"])
+
+    print(f"Rectification maps and parameters saved to {directory}")
+
+
+def modify_calibration_state_for_rectification():
+    """
+    Update the CalibrationState class to include rectification parameters.
+    This function needs to be called before using the CalibrationState class.
+    """
+    # Extend CalibrationState with rectification parameters
+    CalibrationState.rect_R0 = None
+    CalibrationState.rect_P0 = None
+    CalibrationState.rect_R1 = None
+    CalibrationState.rect_P1 = None
+    CalibrationState.disparity_to_depth_map = None
+    CalibrationState.roi0 = None
+    CalibrationState.roi1 = None
+
+
 if __name__ == "__main__":
     if len(sys.argv) != 2:
         print(
@@ -977,6 +1568,14 @@ if __name__ == "__main__":
 
     # Open and parse the settings file
     calibration_settings = parse_calibration_settings_file(sys.argv[1])
+
+    # Check if we're using single camera mode and update settings accordingly
+    use_single_camera = calibration_settings.get("use_single_camera_for_stereo", False)
+    if use_single_camera:
+        print("Using single camera for stereo mode - will split frames horizontally")
+
+    # Extend CalibrationState for rectification parameters
+    modify_calibration_state_for_rectification()
 
     # Try to load existing calibration state
     calibration_state = CalibrationState.load()
@@ -1023,19 +1622,30 @@ if __name__ == "__main__":
             calibration_state.frames_collected_cam0 = True
             calibration_state.save()
 
-    # Camera 1
-    if not calibration_state.frames_collected_cam1:
-        save_frames_single_camera("camera1")
-        calibration_state.frames_collected_cam1 = True
-        calibration_state.save()
+    # Camera 1 - potentially skip in single camera mode since we already collected both
+    if use_single_camera:
+        # In single camera mode, both camera frames should be collected together
+        if not calibration_state.frames_collected_cam1:
+            calibration_state.frames_collected_cam1 = True
+            calibration_state.stereo_frames_collected = True
+            calibration_state.save()
+            print(
+                "Camera 1 frames collected during camera0 collection (single camera mode)"
+            )
     else:
-        print("Camera 1 frames already collected. Skipping.")
-
-        # Option to recollect if needed
-        if ask_yes_no_question("Do you want to recollect frames for camera1?"):
+        # Regular dual camera mode
+        if not calibration_state.frames_collected_cam1:
             save_frames_single_camera("camera1")
             calibration_state.frames_collected_cam1 = True
             calibration_state.save()
+        else:
+            print("Camera 1 frames already collected. Skipping.")
+
+            # Option to recollect if needed
+            if ask_yes_no_question("Do you want to recollect frames for camera1?"):
+                save_frames_single_camera("camera1")
+                calibration_state.frames_collected_cam1 = True
+                calibration_state.save()
 
     """Step2. Obtain camera intrinsic matrices and save them"""
     print_step_banner(2, "CALIBRATE CAMERA INTRINSICS")
@@ -1182,8 +1792,31 @@ if __name__ == "__main__":
     calibration_state.projection_matrix1 = P1
     calibration_state.save()
 
+    """Step6. Generate rectification maps for stereo vision."""
+    print_step_banner(6, "GENERATE RECTIFICATION MAPS")
+
+    # Check if rectification is needed
+    should_rectify = calibration_settings.get("perform_rectification", False)
+
+    if should_rectify and calibration_state.stereo_calibrated:
+        print("Generating rectification maps...")
+
+        # Create rectification maps
+        camera0_rect, camera1_rect = create_rectification_maps(
+            cmtx0, dist0, cmtx1, dist1, R1, T1
+        )
+
+        # Save rectification maps for later use
+        save_rectification_maps(camera0_rect, camera1_rect)
+
+        verify_rectification(camera0_rect, camera1_rect, "camera0", "camera1")
+    elif should_rectify:
+        print("Cannot generate rectification maps: stereo calibration not completed")
+    else:
+        print("Rectification step skipped (not enabled in settings)")
+
     """Optional. Define a different origin point and save the calibration data"""
-    print_step_banner(6, "OPTIONAL: DEFINE ALTERNATIVE WORLD ORIGIN (OPTIONAL)")
+    print_step_banner(7, "OPTIONAL: DEFINE ALTERNATIVE WORLD ORIGIN (OPTIONAL)")
 
     if ask_yes_no_question("Do you want to define an alternative world origin?"):
         print("Define a different world space origin using a checkerboard...")
